@@ -1,0 +1,22 @@
+gimbal_stabilizer:
+  mounting_orientation:
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  
+  joint_limits:
+    vertical_arm:
+      min: -1.57  # -90 degrees
+      max: 1.57   # 90 degrees
+      max_rate: 1.0
+    horizontal_arm:
+      min: -3.14  # -180 degrees
+      max: 3.14   # 180 degrees
+      max_rate: 1.0
+    camera:
+      min: -1.57  # -90 degrees
+      max: 1.57   # 90 degrees
+      max_rate: 1.0
+  
+  filter:
+    hz: 0.1  # Low pass filter Hz
