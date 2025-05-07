@@ -15,6 +15,11 @@ class GimbalStabilizer(Node):
     def __init__(self):
         super().__init__('gimbal_stabilizer')
         
+        self.declare_parameter('gimbal_angle_order', 'zyx')
+        self.gimbal_angle_order = self.get_parameter('gimbal_angle_order').get_parameter_value().string_value
+        if self.gimbal_angle_order not in ['zyx', 'zxy']:
+            self.get_logger().error(f"Invalid gimbal angle order: {self.gimbal_angle_order}. Defaulting to 'zyx'.")
+            self.gimbal_angle_order = 'zyx'
         # Set up tf2
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -162,13 +167,17 @@ class GimbalStabilizer(Node):
         """Compute joint commands to counteract vehicle rotation"""
         # For perfect stabilization, we want to counter the vehicle rotation
         # Note: The signs might need to be inverted depending on joint conventions      
-        rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler('zxy', degrees=False)
+        rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler(self.gimbal_angle_order, degrees=False)
         if self.gimbal_command_rpy_deg is not None:
-            rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.gimbal_command_rpy_deg.z * np.pi/180.0) * Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler('zxy', degrees=False)
+            rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.gimbal_command_rpy_deg.z * np.pi/180.0) * Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler(self.gimbal_angle_order, degrees=False)
         # stabilizing_roll = -self.vehicle_roll
         # stabilizing_pitch = -self.vehicle_pitch
-        stabilizing_roll = -rollpitch_in_horizontal_body_frame[1]
-        stabilizing_pitch = -rollpitch_in_horizontal_body_frame[2]
+        if self.gimbal_angle_order == 'zyx':
+            stabilizing_roll = -rollpitch_in_horizontal_body_frame[2]
+            stabilizing_pitch = -rollpitch_in_horizontal_body_frame[1]
+        elif self.gimbal_angle_order == 'zxy':
+            stabilizing_roll = -rollpitch_in_horizontal_body_frame[1]
+            stabilizing_pitch = -rollpitch_in_horizontal_body_frame[2]
         stabilizing_yaw = -np.pi/2
 
         if self.gimbal_command_rpy_deg is not None:
