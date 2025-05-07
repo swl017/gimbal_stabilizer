@@ -2,13 +2,14 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Imu
 from geometry_msgs.msg import PoseStamped, Quaternion, Vector3
 from std_msgs.msg import Header
 import numpy as np
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 from rclpy.duration import Duration
+from scipy.spatial.transform import Rotation
 
 class GimbalStabilizer(Node):
     def __init__(self):
@@ -60,6 +61,13 @@ class GimbalStabilizer(Node):
             self.pose_callback,
             sensor_qos
         )
+
+        self.imu_sub = self.create_subscription(
+            Imu,
+            'mavros/imu/data',
+            self.imu_callback,
+            sensor_qos
+        )
         
         self.gimbal_command_rpy_sub = self.create_subscription(
             Vector3,
@@ -72,6 +80,8 @@ class GimbalStabilizer(Node):
         self.current_joint_states = None
         self.vehicle_roll = 0.0
         self.vehicle_pitch = 0.0
+        self.vehicle_yaw = 0.0
+        self.vehicle_quat = None
         self.gimbal_command_rpy_deg = None
         
         # Joint names for the gimbal
@@ -107,6 +117,15 @@ class GimbalStabilizer(Node):
         gimbal_rpy_rad.z = current_yaw
         self.current_gimbal_rpy_rad_publisher.publish(gimbal_rpy_rad)
         
+    def imu_callback(self, msg):
+        """Extract roll, pitch, and yaw from IMU data"""
+        # Convert quaternion to euler angles using tf2
+        euler = self.quaternion_to_euler(msg.orientation)
+        self.vehicle_roll = euler[0]
+        self.vehicle_pitch = euler[1]
+        self.vehicle_yaw = euler[2]
+        self.vehicle_quat = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+
     def quaternion_to_euler(self, quaternion: Quaternion) -> tuple:
         """Convert quaternion to euler angles using tf2"""
         # Calculate roll (x-axis rotation)
@@ -134,6 +153,7 @@ class GimbalStabilizer(Node):
         euler = self.quaternion_to_euler(msg.pose.orientation)
         self.vehicle_roll = euler[0]
         self.vehicle_pitch = euler[1]
+        self.vehicle_yaw = euler[2]
 
     def gimbal_command_callback(self, msg):
         self.gimbal_command_rpy_deg = msg
@@ -141,22 +161,16 @@ class GimbalStabilizer(Node):
     def compute_stabilizing_commands(self):
         """Compute joint commands to counteract vehicle rotation"""
         # For perfect stabilization, we want to counter the vehicle rotation
-        # Note: The signs might need to be inverted depending on joint conventions
-        stabilizing_roll = -self.vehicle_roll
-        stabilizing_pitch = -self.vehicle_pitch
+        # Note: The signs might need to be inverted depending on joint conventions      
+        rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler('zxy', degrees=False)
+        if self.gimbal_command_rpy_deg is not None:
+            rollpitch_in_horizontal_body_frame = (Rotation.from_euler('z', -self.gimbal_command_rpy_deg.z * np.pi/180.0) * Rotation.from_euler('z', -self.vehicle_yaw) * Rotation.from_quat(self.vehicle_quat)).as_euler('zxy', degrees=False)
+        # stabilizing_roll = -self.vehicle_roll
+        # stabilizing_pitch = -self.vehicle_pitch
+        stabilizing_roll = -rollpitch_in_horizontal_body_frame[1]
+        stabilizing_pitch = -rollpitch_in_horizontal_body_frame[2]
         stabilizing_yaw = -np.pi/2
 
-        # Keep yaw at current value or 0.0 if no current state
-        # current_yaw = 0.0
-        # if self.current_joint_states is not None:
-        #     try:
-        #         yaw_idx = self.current_joint_states.name.index('cgo3_vertical_arm_joint')
-        #         current_yaw = self.current_joint_states.position[yaw_idx]
-        #     except ValueError:
-        #         pass
-        # else:
-        #     current_yaw = -np.pi/2
-        # If a gimbal command is received, use it instead
         if self.gimbal_command_rpy_deg is not None:
             stabilizing_roll += (self.gimbal_command_rpy_deg.x * np.pi/180.0)
             stabilizing_pitch += (self.gimbal_command_rpy_deg.y * np.pi/180.0)
@@ -167,6 +181,8 @@ class GimbalStabilizer(Node):
     def timer_callback(self):
         """Publish stabilizing joint commands periodically"""
         # Compute stabilizing commands
+        if self.current_joint_states is None or self.vehicle_quat is None:
+            return
         joint_positions = self.compute_stabilizing_commands()
         
         # Create and populate message
