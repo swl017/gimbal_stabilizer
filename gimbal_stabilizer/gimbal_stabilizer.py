@@ -49,9 +49,15 @@ class GimbalStabilizer(Node):
         self.current_gimbal_rpy_rad_publisher = self.create_publisher(
             Vector3, 
             'gimbal_state_rpy_rad', 
-            reliable_qos
+            sensor_qos
         )
-        
+
+        self.current_gimbal_rpy_deg_publisher = self.create_publisher(
+            Vector3, 
+            'gimbal_state_rpy_deg', 
+            sensor_qos
+        )
+
         # Create subscribers with sensor data QoS
         self.joint_state_sub = self.create_subscription(
             JointState,
@@ -121,6 +127,11 @@ class GimbalStabilizer(Node):
         gimbal_rpy_rad.y = current_pitch
         gimbal_rpy_rad.z = current_yaw
         self.current_gimbal_rpy_rad_publisher.publish(gimbal_rpy_rad)
+        gimbal_rpy_deg = Vector3()
+        gimbal_rpy_deg.x = np.degrees(current_roll)
+        gimbal_rpy_deg.y = np.degrees(current_pitch)
+        gimbal_rpy_deg.z = np.degrees(current_yaw)
+        self.current_gimbal_rpy_deg_publisher.publish(gimbal_rpy_deg)
         
     def imu_callback(self, msg):
         """Extract roll, pitch, and yaw from IMU data"""
