@@ -1,0 +1,6 @@
+los_rate_controller:
+  max_gimbal_rate: 6.283185  # 2*pi rad/s (360 deg/s)
+  yaw_limits_deg: [-160.0, 160.0]
+  pitch_limits_deg: [-45.0, 45.0]
+  roll_limits_deg: [-45.0, 45.0]
+  feedback_blend: 0.05  # drift correction (0.0 for direct joint state writing)

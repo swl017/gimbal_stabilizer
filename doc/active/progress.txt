@@ -1,0 +1,17 @@
+========================================
+SESSION LOG — gimbal_stabilizer
+========================================
+Append to this file at the end of each session.
+Format: date, what was done, what's next.
+
+----------------------------------------
+2026-03-24 — Template initialization
+----------------------------------------
+Done:
+- Applied ROS2 AI workflow templates (CLAUDE.md, ARCHITECTURE.md, CONTEXT.md)
+- Documented GimbalStabilizer and JointStatePublisher node contracts
+- Set up doc/active/ session tracking
+
+Next:
+- Fill in feature_list.json with current feature status
+- Add spec documents as needed for new features

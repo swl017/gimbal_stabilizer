@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'joint_state_publisher = gimbal_stabilizer.joint_state_publisher:main',
             'gimbal_stabilizer = gimbal_stabilizer.gimbal_stabilizer:main',
+            'los_rate_controller = gimbal_stabilizer.los_rate_controller:main',
         ],
     },
 )

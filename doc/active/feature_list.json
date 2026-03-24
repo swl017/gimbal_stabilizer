@@ -1,0 +1,32 @@
+{
+  "features": [
+    {
+      "id": "gimbal_stabilization",
+      "name": "3-axis gimbal stabilization",
+      "status": "done",
+      "notes": "Counteracts vehicle rotation using IMU data, supports zyx/zxy Euler conventions",
+      "last_updated": "2026-03-24"
+    },
+    {
+      "id": "gimbal_command_tracking",
+      "name": "Gimbal command angle tracking",
+      "status": "done",
+      "notes": "Tracks desired roll/pitch/yaw angles from gimbal_command_rpy_deg topic",
+      "last_updated": "2026-03-24"
+    },
+    {
+      "id": "multi_agent_launch",
+      "name": "Multi-agent parametric launch",
+      "status": "done",
+      "notes": "Spawns per-vehicle gimbal nodes from vehicles.yaml + gimbal_config.yaml",
+      "last_updated": "2026-03-24"
+    },
+    {
+      "id": "los_rate_controller",
+      "name": "World-frame LOS rate gimbal controller",
+      "status": "done",
+      "notes": "Ports iris_ma6 analytical gimbal controller to ROS2. Accepts normalized az/el rate commands, integrates in world frame, computes body-frame joints via IK. Multi-agent launch via multi_agent_los_rate.launch.py",
+      "last_updated": "2026-03-24"
+    }
+  ]
+}

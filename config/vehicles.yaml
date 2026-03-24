@@ -1,7 +1,10 @@
 vehicles:
   - namespace: "px4_1"
     update_rate: 100.0
+    model: "iris_gimbal3"
   - namespace: "px4_2"
     update_rate: 100.0
+    model: "iris_gimbal3"
   - namespace: "px4_3"
     update_rate: 100.0
+    model: "iris_gimbal3"
