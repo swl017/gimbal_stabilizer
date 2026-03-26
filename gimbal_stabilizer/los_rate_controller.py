@@ -29,7 +29,7 @@ import math
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Vector3
+from geometry_msgs.msg import Vector3, Vector3Stamped
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -38,7 +38,7 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Header
+from std_msgs.msg import Float32, Float64, Header
 
 # Body mesh is rotated 90 deg CCW from physics frame (visual forward = body +Y).
 # This offset is added to yaw joint targets so that controller yaw=0 maps to
@@ -69,6 +69,14 @@ def _quat_rotate_inverse(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
     """
     w = q_wxyz[0]
     u = -q_wxyz[1:4]  # conjugate: negate xyz
+    t = 2.0 * np.cross(u, v)
+    return v + w * t + np.cross(u, t)
+
+
+def _quat_rotate(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector v by quaternion q (wxyz format)."""
+    w = q_wxyz[0]
+    u = q_wxyz[1:4]
     t = 2.0 * np.cross(u, v)
     return v + w * t + np.cross(u, t)
 
@@ -157,6 +165,15 @@ class LOSRateController(Node):
             Vector3, 'gimbal_state_rpy_deg', sensor_qos)
         self._los_state_pub = self.create_publisher(
             Vector3, 'gimbal_los_state', sensor_qos)
+        self._combined_ang_vel_w_pub = self.create_publisher(
+            Vector3Stamped, 'combined_ang_vel_w', sensor_qos)
+        self._zoom_level_pub = self.create_publisher(
+            Float32, 'zoom_level', sensor_qos)
+
+        # -- Cached body angular velocity (from IMU) --
+        self._body_angular_velocity_b: np.ndarray = np.zeros(3)
+        # -- Cached zoom level (from sim camera/zoom topic) --
+        self._zoom_level: float = 1.0
 
         # -- Subscribers --
         self.create_subscription(
@@ -168,6 +185,9 @@ class LOSRateController(Node):
         self.create_subscription(
             JointState, 'isaac_joint_states',
             self._joint_state_callback, sensor_qos)
+        self.create_subscription(
+            Float64, 'camera/zoom',
+            self._zoom_callback, 10)
 
         # -- Timer --
         timer_period = 1.0 / self._update_rate
@@ -190,9 +210,15 @@ class LOSRateController(Node):
         self._cmd_el_rate = float(np.clip(msg.y, -1.0, 1.0))
 
     def _imu_callback(self, msg: Imu):
-        """Cache vehicle quaternion, converting ROS2 xyzw to wxyz."""
+        """Cache vehicle quaternion and body angular velocity."""
         q = msg.orientation
         self._vehicle_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
+        av = msg.angular_velocity
+        self._body_angular_velocity_b = np.array([av.x, av.y, av.z])
+
+    def _zoom_callback(self, msg: Float64):
+        """Cache zoom level from sim camera/zoom topic."""
+        self._zoom_level = float(msg.data)
 
     def _joint_state_callback(self, msg: JointState):
         """Parse and cache actual joint positions by name."""
@@ -389,6 +415,25 @@ class LOSRateController(Node):
         los.y = self._elevation_world
         los.z = 0.0
         self._los_state_pub.publish(los)
+
+        # Combined angular velocity (body + gimbal) in world frame
+        dt = 1.0 / self._update_rate
+        gimbal_yaw_rate = (self._yaw - self._yaw_prev) / dt
+        gimbal_pitch_rate = (self._pitch - self._pitch_prev) / dt
+        gimbal_ang_vel_b = np.array([0.0, gimbal_pitch_rate, gimbal_yaw_rate])
+        combined_b = self._body_angular_velocity_b + gimbal_ang_vel_b
+        combined_w = _quat_rotate(self._vehicle_quat_wxyz, combined_b)
+        cav_msg = Vector3Stamped()
+        cav_msg.header.stamp = self.get_clock().now().to_msg()
+        cav_msg.vector.x = float(combined_w[0])
+        cav_msg.vector.y = float(combined_w[1])
+        cav_msg.vector.z = float(combined_w[2])
+        self._combined_ang_vel_w_pub.publish(cav_msg)
+
+        # Zoom level
+        zoom_msg = Float32()
+        zoom_msg.data = float(self._zoom_level)
+        self._zoom_level_pub.publish(zoom_msg)
 
 
 def main(args=None):
