@@ -352,19 +352,35 @@ class LOSRateController(Node):
         self._cmd_pub.publish(msg)
 
     def _publish_state(self):
-        """Publish gimbal state for monitoring."""
+        """Publish gimbal state from actual joint feedback.
+
+        Uses actual joint positions (from isaac_joint_states) to match
+        real hardware encoder angles (0x26). Falls back to internal
+        targets if joint feedback is not yet available.
+        """
+        if self._joint_positions_actual is not None:
+            # Actual joint positions — matches real encoder output
+            yaw = self._joint_positions_actual['yaw'] - YAW_JOINT_OFFSET
+            roll = self._joint_positions_actual['roll']
+            pitch = self._joint_positions_actual['pitch']
+        else:
+            # Fallback to internal targets before joint feedback arrives
+            yaw = self._yaw
+            roll = self._roll
+            pitch = self._pitch
+
         # Body-frame RPY in radians
         rpy_rad = Vector3()
-        rpy_rad.x = self._roll
-        rpy_rad.y = self._pitch
-        rpy_rad.z = self._yaw
+        rpy_rad.x = roll
+        rpy_rad.y = pitch
+        rpy_rad.z = yaw
         self._rpy_rad_pub.publish(rpy_rad)
 
         # Body-frame RPY in degrees
         rpy_deg = Vector3()
-        rpy_deg.x = math.degrees(self._roll)
-        rpy_deg.y = math.degrees(self._pitch)
-        rpy_deg.z = math.degrees(self._yaw)
+        rpy_deg.x = math.degrees(roll)
+        rpy_deg.y = math.degrees(pitch)
+        rpy_deg.z = math.degrees(yaw)
         self._rpy_deg_pub.publish(rpy_deg)
 
         # World-frame azimuth/elevation
