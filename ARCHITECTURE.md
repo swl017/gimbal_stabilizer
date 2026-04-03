@@ -43,7 +43,7 @@ RL policy ──[gimbal_cmd_los_rate]──→ los_rate_controller    (Vector3: 
 los_rate_controller ──[isaac_joint_commands]──→ Isaac Sim   (JointState: joint position commands)
 los_rate_controller ──[gimbal_state_rpy_rad]──→ downstream  (Vector3: body-frame RPY)
 los_rate_controller ──[gimbal_state_rpy_deg]──→ downstream  (Vector3: body-frame RPY degrees)
-los_rate_controller ──[gimbal_los_state]──→ downstream      (Vector3: world-frame az/el)
+los_rate_controller ──[gimbal_los_state_deg]──→ downstream      (Vector3: world-frame az/el)
 ```
 
 The launch file is the sole integration point. Nodes should be independently testable.
@@ -73,7 +73,7 @@ los_rate_controller (Decoupled pattern):
     ├─ World-to-body IK (atan2 decomposition via quaternion inverse rotation)
     ├─ Compute stabilizing roll (horizon leveling)
     ├─ Clamp to joint limits
-    ├─ Publish isaac_joint_commands, gimbal_state, gimbal_los_state
+    ├─ Publish isaac_joint_commands, gimbal_state, gimbal_los_state_deg
 ```
 
 ## Topic/Service Interface
@@ -88,7 +88,7 @@ los_rate_controller (Decoupled pattern):
 | `isaac_joint_commands` | `sensor_msgs/JointState` | Pub | Reliable | both | Joint position commands |
 | `gimbal_state_rpy_rad` | `geometry_msgs/Vector3` | Pub | BestEffort | both | Body-frame RPY (radians) |
 | `gimbal_state_rpy_deg` | `geometry_msgs/Vector3` | Pub | BestEffort | both | Body-frame RPY (degrees) |
-| `gimbal_los_state` | `geometry_msgs/Vector3` | Pub | BestEffort | los_rate_controller | World-frame az/el (radians) |
+| `gimbal_los_state_deg` | `geometry_msgs/Vector3` | Pub | BestEffort | los_rate_controller | World-frame az/el (degrees) |
 
 ## Parameters
 

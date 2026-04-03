@@ -115,7 +115,7 @@ class GimbalStabilizer(Node):
         for joint in msg.name:
             if joint == 'cgo3_vertical_arm_joint':
                 yaw_idx = msg.name.index(joint)
-                current_yaw = msg.position[yaw_idx] + np.pi/2  # Remove YAW_JOINT_OFFSET (-π/2)
+                current_yaw = msg.position[yaw_idx] - np.pi/2  # Remove YAW_JOINT_OFFSET (+π/2)
             if joint == 'cgo3_horizontal_arm_joint':
                 roll_idx = msg.name.index(joint)
                 current_roll = msg.position[roll_idx]

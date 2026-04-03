@@ -49,29 +49,41 @@ Subscribes to `mavros/imu/data` published by offboard_py. Subscribes to `isaac_j
 # LOSRateController Node
 
 ## Purpose
-World-frame LOS (Line-of-Sight) rate gimbal controller for RL policy deployment testing. Ports the iris_ma6 analytical gimbal controller to ROS2. Accepts normalized azimuth/elevation rate commands (matching the RL policy action space), integrates them in world frame, and computes body-frame joint positions via analytical inverse kinematics.
+World-frame LOS (Line-of-Sight) gimbal controller for RL policy deployment. Ports the iris_ma6 Jacobian-inverse gimbal controller to ROS2. Two modes:
+
+- **Rate mode** (default): Accepts normalized azimuth/elevation rate commands (matching RL policy action space), integrates into persistent world-frame target, computes body-frame joint positions via unified J^{-1} control law.
+- **Position mode**: Accepts world-frame azimuth/elevation position targets (from gimbal_los_tracker), computes body-frame joints via analytical atan2 IK.
 
 ## Subscriptions
-- `gimbal_cmd_los_rate` (`geometry_msgs/msg/Vector3`) — normalized LOS rate commands: x=azimuth_rate, y=elevation_rate [-1,1]
-- `mavros/imu/data` (`sensor_msgs/msg/Imu`) — vehicle IMU data (quaternion for IK)
-- `isaac_joint_states` (`sensor_msgs/msg/JointState`) — actual joint positions for feedback blend
+- `gimbal_cmd_los_rate` (`geometry_msgs/msg/Vector3`) — normalized LOS rate commands: x=azimuth_rate, y=elevation_rate [-1,1] (rate mode)
+- `gimbal_cmd_los_world_deg` (`geometry_msgs/msg/Vector3`) — world-frame position target: z=azimuth, y=elevation [deg] (position mode)
+- `mavros/imu/data` (`sensor_msgs/msg/Imu`) — vehicle IMU (quaternion + angular velocity for stabilization)
+- `isaac_joint_states` (`sensor_msgs/msg/JointState`) — actual joint positions (feedback)
+- `camera/zoom` (`std_msgs/msg/Float64`) — sim camera zoom level
+- `zoom_cmd` (`std_msgs/msg/Float32`) — normalized zoom rate command [-1,1]
 
 ## Publishers
-- `isaac_joint_commands` (`sensor_msgs/msg/JointState`) — joint position targets [yaw+offset, roll, pitch]
-- `gimbal_state_rpy_rad` (`geometry_msgs/msg/Vector3`) — body-frame RPY in radians
-- `gimbal_state_rpy_deg` (`geometry_msgs/msg/Vector3`) — body-frame RPY in degrees
-- `gimbal_los_state` (`geometry_msgs/msg/Vector3`) — world-frame azimuth (x) / elevation (y) in radians
+- `isaac_joint_commands` (`sensor_msgs/msg/JointState`) — joint targets (position and/or velocity)
+- `gimbal_state_rpy_deg` (`geometry_msgs/msg/Vector3`) — actual body-frame RPY in degrees (from joint feedback)
+- `gimbal_los_state_deg` (`geometry_msgs/msg/Vector3`) — world-frame azimuth (x) / elevation (y) in degrees
+- `combined_ang_vel_w` (`geometry_msgs/msg/Vector3Stamped`) — body + gimbal angular velocity in world frame
+- `zoom_level` (`std_msgs/msg/Float32`) — current zoom level
+- `camera/zoom` (`std_msgs/msg/Float64`) — sim camera zoom command
 
 ## Parameters
-- `max_gimbal_rate` (`float`, default: `6.283185`) — maximum gimbal rate [rad/s] (2π = 360 deg/s)
-- `yaw_limits_deg` (`list[float]`, default: `[-160, 160]`) — yaw joint limits [deg]
-- `pitch_limits_deg` (`list[float]`, default: `[-45, 45]`) — pitch joint limits [deg]
-- `roll_limits_deg` (`list[float]`, default: `[-45, 45]`) — roll joint limits [deg]
-- `feedback_blend` (`float`, default: `0.05`) — drift correction factor (0.0 for direct state writing)
-- `update_rate` (`float`, default: `100.0`) — control loop rate [Hz]
+- `model` (`string`, default: `iris_gimbal3`) — gimbal model, selects joint name mapping
+- `control_mode` (`string`, default: `position`) — actuator command: `position`, `position_velocity`, or `velocity`
+- `control_trigger` (`string`, default: `joint_states`) — what triggers control loop: `joint_states` (sim-time dedup) or `imu` (higher rate)
+- `pointing_gain` (`float`, default: `32.5`) — proportional gain K for J^{-1} attitude error (matches iris_ma6 training)
+- `servo_rate_limit` (`float`, default: `0.0`) — max omega_cmd per-component [rad/s] before J^{-1}. 0 = use max_gimbal_rate. Prevents overshoot with delayed sim feedback.
+- `max_gimbal_rate` (`float`, default: `π`) — max gimbal angular rate [rad/s], used for LOS rate normalization
+- `yaw_limits_deg` (`list[float]`, default: `[-270, 270]`)
+- `pitch_limits_deg` (`list[float]`, default: `[-45, 45]`)
+- `roll_limits_deg` (`list[float]`, default: `[-45, 45]`)
+- `update_rate` (`float`, default: `100.0`) — nominal control rate [Hz]
 
 ## Dependencies
-Subscribes to `mavros/imu/data` published by offboard_py. Subscribes to `isaac_joint_states` from Isaac Sim. Publishes `isaac_joint_commands` consumed by Isaac Sim. **Mutually exclusive** with gimbal_stabilizer — only one should run per vehicle.
+Subscribes to `mavros/imu/data` published by offboard_py. Subscribes to `isaac_joint_states` from PegasusSimulator OmniGraph. Publishes `isaac_joint_commands` consumed by PegasusSimulator OmniGraph (`ROS2SubscribeJointState` → `IsaacArticulationController`). **Mutually exclusive** with gimbal_stabilizer — only one should run per vehicle.
 
 ## Key Files
 - `gimbal_stabilizer/los_rate_controller.py` — Node implementation
@@ -80,21 +92,35 @@ Subscribes to `mavros/imu/data` published by offboard_py. Subscribes to `isaac_j
 
 ## Calling Contract
 
-**Pattern**: Decoupled (subscribe → cache, timer → publish)
+**Pattern**: Event-driven (no timer — control runs in subscriber callbacks)
 
-- `_los_rate_cmd_callback()`: Caches normalized azimuth/elevation rate commands. No publishing.
-- `_imu_callback()`: Caches vehicle quaternion (converts xyzw→wxyz). No publishing.
-- `_joint_state_callback()`: Caches actual joint positions by name. No publishing.
-- `_timer_callback()` (100 Hz): Feedback blend → rate integration → world-to-body IK → stabilizing roll → clamp → publish. Sole periodic mutation point.
+- `_los_rate_cmd_callback()`: Caches normalized rate commands. Clears position target (switches to rate mode).
+- `_los_world_cmd_callback()`: Caches world-frame position target. Clears rate commands (switches to position mode).
+- `_imu_callback()`: Caches vehicle quaternion (xyzw→wxyz) + angular velocity. Triggers control if `control_trigger=imu`.
+- `_joint_state_callback()`: Caches actual joint positions. Deduplicates by sim timestamp. Triggers control if `control_trigger=joint_states`.
+- `_run_control(dt)`: Core control law. Position mode: atan2 IK. Rate mode: J^{-1}(−K·att_error − ω_body). Publishes joint commands + state.
+
+## Control Law (Rate Mode)
+```
+1. Integrate LOS rate → persistent world-frame az/el target
+2. Desired camera quaternion in body frame (Gram-Schmidt)
+3. Current gimbal quaternion from actual joints
+4. Quaternion error → body-frame att_error
+5. omega_cmd = clip(-K * att_error, ±servo_rate_limit)
+6. qdot = J^{-1} * (omega_cmd - omega_body)
+7. q_ref = actual + qdot * dt → clamp to limits
+```
 
 ## Joint Mapping
-Same as gimbal_stabilizer:
-- `cgo3_vertical_arm_joint` — yaw (YAW_JOINT_OFFSET = -π/2 applied at publish)
-- `cgo3_horizontal_arm_joint` — roll
-- `cgo3_camera_joint` — pitch
+Resolved at startup from `model` parameter (YAW_JOINT_OFFSET = +π/2 applied at publish):
+
+| Model | Yaw | Roll | Pitch |
+|-------|-----|------|-------|
+| `cgo3` | `cgo3_vertical_arm_joint` | `cgo3_horizontal_arm_joint` | `cgo3_camera_joint` |
+| `iris_gimbal3` | `yaw_joint` | `roll_joint` | `pitch_joint` |
 
 ## Reference Implementation
-Ported from `IsaacLab/.../iris_ma6/controller/gimbal_controller_analytical.py`
+Ported from `IsaacLab/.../iris_ma6/controller/gimbal_controller_jacobian.py`
 
 ---
 

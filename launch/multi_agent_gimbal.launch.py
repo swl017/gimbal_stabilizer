@@ -59,6 +59,7 @@ def launch_setup(context):
             #     ('state/pose', f'{namespace}/state/pose'),
             # ],
             parameters=[{
+                'use_sim_time': True,
                 'vehicle_name': namespace,
                 'update_rate': vehicle.get('update_rate', 100.0),
                 **node_params

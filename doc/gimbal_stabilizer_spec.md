@@ -37,13 +37,24 @@ We are building SITL simulation as part of sim-to-real deployment using policy t
                     isaac_joint_commands
                     JointState [pos, vel]
                               │
-                              ▼
-              ┌───────────────────────────────┐
-              │     Isaac Sim Actuator        │
-              │  PD: τ = k(q*-q) + d(q̇*-q̇)  │
-              │  k=1000, d=50                 │
-              └───────────────────────────────┘
+           ┌──────────────────┼──────────────────┐
+           │  PegasusSimulator OmniGraph          │
+           │  (per-vehicle ActionGraph)            │
+           │                                      │
+           │  ROS2SubscribeJointState              │
+           │          │                            │
+           │          ▼                            │
+           │  IsaacArticulationController          │
+           │          │                            │
+           │          ▼                            │
+           │  PhysX joints (yaw/roll/pitch)        │
+           │          │                            │
+           │          ▼                            │
+           │  ROS2PublishJointState ───────────────┼──► isaac_joint_states
+           └──────────────────────────────────────┘
 ```
+
+The OmniGraph ActionGraph is configured per vehicle in the PegasusSimulator launch script (e.g. `px4_multi_world_iris_gimbal3.isaac.py`). It wires `ROS2SubscribeJointState` → `IsaacArticulationController` → `ROS2PublishJointState`, providing both command application and state feedback via ROS2 topics.
 
 ## 2. Mathematical Formulation
 
@@ -220,7 +231,7 @@ Source: `config/los_rate_config.yaml`
 | Joint commands | `isaac_joint_commands` | `JointState` | name (model-dependent), position=[ψ+offset, φ, θ], velocity=[ψ̇, φ̇, θ̇] | [rad], [rad/s] | Isaac Sim |
 | Gimbal state (rad) | `gimbal_state_rpy_rad` | `Vector3` | x=roll, y=pitch, z=yaw | [rad] | Monitoring |
 | Gimbal state (deg) | `gimbal_state_rpy_deg` | `Vector3` | x=roll, y=pitch, z=yaw | [deg] | Monitoring |
-| World LOS state | `gimbal_los_state` | `Vector3` | x=azimuth, y=elevation | [rad] | Monitoring |
+| World LOS state | `gimbal_los_state_deg` | `Vector3` | x=azimuth, y=elevation | [deg] | Monitoring |
 
 ### 4.3 Dependencies
 
@@ -285,7 +296,7 @@ Source: `config/los_rate_config.yaml`
 - **Analytical mode only**: No Jacobian mode with velocity feedforward tracking (unlike iris_ma6 which supports both). The analytical mode is zero-lag and requires no gain tuning.
 - **Single-vehicle per node**: Each node handles one vehicle. No batched/vectorized processing (unlike iris_ma6's GPU-tensorized controller).
 - **No gimbal lock protection**: Pitch limits are set to ±45° to stay away from the ±90° singularity, but no explicit singularity detection is implemented.
-- **Isaac Sim integration gap**: PegasusSimulator's ROS2 backend does not natively subscribe to `isaac_joint_commands` for gimbal joints — this topic is consumed only by Isaac Lab's direct environment. A PegasusSimulator-side subscriber must be added for SITL deployment.
+- **OmniGraph dependency**: Gimbal command reception relies on an OmniGraph ActionGraph configured in the PegasusSimulator launch script, not PegasusSimulator's Python `ROS2Backend`. If a launch script omits the ActionGraph setup, gimbal commands will not be applied.
 
 ## 7. References
 - **`iris_ma6` gimbal controller** `IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/iris_ma6/controller/CONTEXT.md`
@@ -295,3 +306,4 @@ Source: `config/los_rate_config.yaml`
 - **ROS2 config** `ros2_ws/src/gimbal_stabilizer/config/los_rate_config.yaml`
 - **Actuator config (iris_gimbal3)** `IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/iris_gimbal3.py` — ImplicitActuatorCfg: k=1000, d=50, vel_limit=6π rad/s
 - **Gimbal stabilization tuning results** `IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/iris_ma6/controller/doc/gimbal_stabilization_status.md`
+- **PegasusSimulator SITL launch (OmniGraph setup)** `PegasusSimulator/launch/px4_multi_world_iris_gimbal3.isaac.py`

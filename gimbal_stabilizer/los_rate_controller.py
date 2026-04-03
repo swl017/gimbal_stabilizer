@@ -2,27 +2,44 @@
 from __future__ import annotations
 """World-frame LOS-rate gimbal controller for RL policy deployment.
 
-Ports the iris_ma6 analytical gimbal controller to ROS2. Accepts normalized
-world-frame azimuth/elevation rate commands, integrates them, and computes
-body-frame joint positions via inverse kinematics.
+Ports the iris_ma6 Jacobian gimbal controller to ROS2. Accepts normalized
+world-frame azimuth/elevation rate commands, integrates them into a
+persistent world-frame target, and computes body-frame joint positions
+via the unified Jacobian-inverse control law.
 
-Algorithm (from gimbal_controller_analytical.py):
-  1. Feedback blend: correct internal state drift from actual joints
-  2. World-frame rate integration: az += cmd * max_rate * dt
-  3. World-to-body IK: atan2 decomposition of target direction in body frame
-  4. Stabilizing roll: project world-up into yawed gimbal frame
-  5. Clamp to joint limits
-  6. Publish joint position targets
+Rate mode algorithm (from iris_ma6 gimbal_controller_jacobian.py):
+  1. Integrate LOS rate commands into world-frame az/el target
+  2. Compute desired camera quaternion in body frame
+  3. Quaternion error from actual joints → body angular error
+  4. omega_cmd = -K_pointing * att_error
+  5. qdot = J^{-1} * (omega_cmd - omega_body)
+  6. Position target = actual + qdot * dt
+
+Position mode algorithm (analytical IK, for point_to_region):
+  1. World-frame target → body-frame yaw/pitch via atan2 IK
+  2. Stabilizing roll from world-up projection
+  3. Direct position targets (no velocity dynamics)
+
+LOS convention: positive elevation = up (ENU standard).
 
 Frame Conventions:
 - WORLD (ENU): +X=East, +Y=North, +Z=Up
 - BODY (FLU):  +X=Forward, +Y=Left, +Z=Up
 - Gimbal joint order: Yaw(Z) -> Roll(X) -> Pitch(Y)
-- YAW_JOINT_OFFSET = -pi/2 (body mesh visual rotation compensation)
+- YAW_JOINT_OFFSET = +pi/2 (body mesh visual rotation compensation)
 
 Quaternion Convention:
 - ROS2 Imu msg: xyzw
 - Internal math: wxyz (matching Isaac Lab / iris_ma6)
+
+Gimbal Jacobian (maps joint velocities -> body-frame angular velocity):
+  J = [[ 0,      cos(psi),    -sin(psi)*cos(phi) ],
+       [ 0,      sin(psi),     cos(psi)*cos(phi) ],
+       [ 1,      0,            sin(phi)           ]]
+
+  J^{-1} = [[ sy*sr/cr,  -cy*sr/cr,  1 ],
+            [ cy,         sy,         0 ],
+            [-sy/cr,      cy/cr,      0 ]]
 """
 
 import math
@@ -40,35 +57,32 @@ from rclpy.qos import (
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Float32, Float64, Header
 
-# Body mesh is rotated 90 deg CCW from physics frame (visual forward = body +Y).
-# This offset is added to yaw joint targets so that controller yaw=0 maps to
-# body +X (physics forward).
-YAW_JOINT_OFFSET = -math.pi / 2
+# With identity camera orientation on pitch_link, yaw_joint=0 points camera
+# along body -Y (right side). This offset is added to yaw joint targets so
+# that controller yaw=0 maps to body +X (physics forward).
+YAW_JOINT_OFFSET = math.pi / 2
 
 # Joint name mapping per gimbal model.  Order: [yaw, roll, pitch].
-# Cross-referenced against USD assets in PegasusSimulator/.../assets/Robots/.
 GIMBAL_MODELS: dict[str, list[str]] = {
     'cgo3': [
-        'cgo3_vertical_arm_joint',     # yaw  — iris_gimbal.usda, typhoon_h480.usda
+        'cgo3_vertical_arm_joint',     # yaw
         'cgo3_horizontal_arm_joint',   # roll
         'cgo3_camera_joint',           # pitch
     ],
     'iris_gimbal3': [
-        'yaw_joint',                   # yaw  — iris_gimbal3.usda, iris_gimbal2.usda
+        'yaw_joint',                   # yaw
         'roll_joint',                  # roll
         'pitch_joint',                 # pitch
     ],
 }
 
 
-def _quat_rotate_inverse(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate vector v by the inverse of quaternion q (wxyz format).
+# ── Quaternion helpers (wxyz convention) ─────────────────────────────
 
-    Uses the cross-product form: v' = v + 2w*(u x v) + 2*(u x (u x v))
-    where u = -[x,y,z] (conjugate).
-    """
+def _quat_rotate_inverse(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate vector v by the inverse of quaternion q (wxyz format)."""
     w = q_wxyz[0]
-    u = -q_wxyz[1:4]  # conjugate: negate xyz
+    u = -q_wxyz[1:4]  # conjugate
     t = 2.0 * np.cross(u, v)
     return v + w * t + np.cross(u, t)
 
@@ -81,37 +95,95 @@ def _quat_rotate(q_wxyz: np.ndarray, v: np.ndarray) -> np.ndarray:
     return v + w * t + np.cross(u, t)
 
 
-class LOSRateController(Node):
-    """World-frame LOS-rate gimbal controller.
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Multiply two quaternions in wxyz format."""
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ])
 
-    Subscribes to normalized azimuth/elevation rate commands and vehicle IMU,
-    computes body-frame joint positions via analytical inverse kinematics,
-    and publishes joint position targets.
+
+def _quat_inv(q: np.ndarray) -> np.ndarray:
+    """Inverse (conjugate) of unit quaternion in wxyz format."""
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def _quat_from_euler_single(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Euler XYZ (roll, pitch, yaw) → quaternion wxyz."""
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return np.array([
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    ])
+
+
+def _rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix → quaternion wxyz (Shepperd's method)."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 2.0 * math.sqrt(1.0 + trace)
+        return np.array([s / 4, (R[2, 1] - R[1, 2]) / s,
+                         (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        return np.array([(R[2, 1] - R[1, 2]) / s, s / 4,
+                         (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 - R[0, 0] + R[1, 1] - R[2, 2])
+        return np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                         s / 4, (R[1, 2] + R[2, 1]) / s])
+    else:
+        s = 2.0 * math.sqrt(1.0 - R[0, 0] - R[1, 1] + R[2, 2])
+        return np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                         (R[1, 2] + R[2, 1]) / s, s / 4])
+
+
+# ── Controller node ──────────────────────────────────────────────────
+
+class LOSRateController(Node):
+    """World-frame LOS gimbal controller with Jacobian-inverse tracking.
+
+    Rate mode: Jacobian J^{-1} control law (matching iris_ma6 training).
+    Position mode: analytical atan2 IK (for point_to_region commands).
     """
 
     def __init__(self):
         super().__init__('los_rate_controller')
 
-        # -- Declare parameters with iris_ma6 defaults --
-        self.declare_parameter('max_gimbal_rate', 2.0 * math.pi)
+        # -- Declare parameters --
+        self.declare_parameter('max_gimbal_rate', math.pi)
+        self.declare_parameter('pointing_gain', 32.5)
         self.declare_parameter('yaw_limits_deg', [-160.0, 160.0])
         self.declare_parameter('pitch_limits_deg', [-45.0, 45.0])
         self.declare_parameter('roll_limits_deg', [-45.0, 45.0])
-        self.declare_parameter('feedback_blend', 0.05)
         self.declare_parameter('update_rate', 100.0)
-        self.declare_parameter('model', 'cgo3')
+        self.declare_parameter('model', 'iris_gimbal3')
         self.declare_parameter('control_mode', 'position')
+        self.declare_parameter('control_trigger', 'joint_states')  # "joint_states" or "imu"
+        self.declare_parameter('max_zoom_rate', 2.0)
+        self.declare_parameter('zoom_min', 1.0)
+        self.declare_parameter('zoom_max', 30.0)
+        self.declare_parameter('servo_rate_limit', 0.0)  # 0 = use max_gimbal_rate
 
         self._max_gimbal_rate = self.get_parameter('max_gimbal_rate').value
+        self._pointing_gain = self.get_parameter('pointing_gain').value
         yaw_lim_deg = self.get_parameter('yaw_limits_deg').value
         pitch_lim_deg = self.get_parameter('pitch_limits_deg').value
         roll_lim_deg = self.get_parameter('roll_limits_deg').value
         self._yaw_limits = (math.radians(yaw_lim_deg[0]), math.radians(yaw_lim_deg[1]))
         self._pitch_limits = (math.radians(pitch_lim_deg[0]), math.radians(pitch_lim_deg[1]))
         self._roll_limits = (math.radians(roll_lim_deg[0]), math.radians(roll_lim_deg[1]))
-        self._feedback_blend = self.get_parameter('feedback_blend').value
-        self._update_rate = self.get_parameter('update_rate').value
+        self._update_rate = float(self.get_parameter('update_rate').value)
         self._control_mode = self.get_parameter('control_mode').value
+        self._control_trigger = self.get_parameter('control_trigger').value
 
         # -- Resolve joint names from model --
         model = self.get_parameter('model').value
@@ -119,109 +191,146 @@ class LOSRateController(Node):
             raise ValueError(
                 f"Unknown gimbal model '{model}'. "
                 f"Supported: {list(GIMBAL_MODELS.keys())}")
+        self._joint_names = GIMBAL_MODELS[model]
 
         # -- Internal state --
-        # World-frame target angles (rate-integrated pointing direction)
-        self._azimuth_world = 0.0
-        self._elevation_world = 0.0
-        # Body-frame joint angle targets
         self._yaw = 0.0
         self._roll = 0.0
         self._pitch = 0.0
-        # Previous-step targets for finite-difference velocity
-        self._yaw_prev = 0.0
-        self._roll_prev = 0.0
-        self._pitch_prev = 0.0
+        # Persistent world-frame LOS target (rate mode integrates into this)
+        self._az_world = 0.0
+        self._el_world = 0.0
+        self._az_world_initialized = False
+        # Previous actual joint positions for velocity computation
+        self._prev_actual_yaw = 0.0
+        self._prev_actual_roll = 0.0
+        self._prev_actual_pitch = 0.0
+        # Timestamp for actual dt measurement
+        self._prev_time: float | None = None
+        # Diagnostic logging counter (ticket #022)
+        self._diag_counter = 0
 
         # -- Cached subscriber data --
         self._vehicle_quat_wxyz: np.ndarray | None = None
+        self._body_angular_velocity_b: np.ndarray = np.zeros(3)
         self._joint_positions_actual: dict | None = None
         self._cmd_az_rate = 0.0
         self._cmd_el_rate = 0.0
+        # World-frame position target (from point_to_region)
+        self._target_az_world: float | None = None
+        self._target_el_world: float | None = None
 
-        # -- Joint names (resolved from model) --
-        self._joint_names = GIMBAL_MODELS[model]
+        # -- Zoom state --
+        self._zoom_level: float = 1.0
+        self._zoom_cmd_rate = 0.0
+        self._max_zoom_rate = float(self.get_parameter('max_zoom_rate').value or 2.0)
+        self._zoom_min = float(self.get_parameter('zoom_min').value or 1.0)
+        self._zoom_max = float(self.get_parameter('zoom_max').value or 30.0)
+        servo_lim = float(self.get_parameter('servo_rate_limit').value or 0.0)
+        self._servo_rate_limit = servo_lim if servo_lim > 0 else self._max_gimbal_rate
 
         # -- QoS profiles --
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+            history=QoSHistoryPolicy.KEEP_LAST, depth=1)
         reliable_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.VOLATILE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
+            history=QoSHistoryPolicy.KEEP_LAST, depth=10)
 
         # -- Publishers --
         self._cmd_pub = self.create_publisher(
             JointState, 'isaac_joint_commands', reliable_qos)
-        self._rpy_rad_pub = self.create_publisher(
-            Vector3, 'gimbal_state_rpy_rad', sensor_qos)
         self._rpy_deg_pub = self.create_publisher(
             Vector3, 'gimbal_state_rpy_deg', sensor_qos)
         self._los_state_pub = self.create_publisher(
-            Vector3, 'gimbal_los_state', sensor_qos)
+            Vector3, 'gimbal_los_state_deg', sensor_qos)
         self._combined_ang_vel_w_pub = self.create_publisher(
             Vector3Stamped, 'combined_ang_vel_w', sensor_qos)
         self._zoom_level_pub = self.create_publisher(
             Float32, 'zoom_level', sensor_qos)
-
-        # -- Cached body angular velocity (from IMU) --
-        self._body_angular_velocity_b: np.ndarray = np.zeros(3)
-        # -- Cached zoom level (from sim camera/zoom topic) --
-        self._zoom_level: float = 1.0
+        self._camera_zoom_pub = self.create_publisher(Float64, 'camera/zoom', 10)
 
         # -- Subscribers --
         self.create_subscription(
             Vector3, 'gimbal_cmd_los_rate',
             self._los_rate_cmd_callback, sensor_qos)
         self.create_subscription(
+            Vector3, 'gimbal_cmd_los_world_deg',
+            self._los_world_cmd_callback, reliable_qos)
+        self.create_subscription(
             Imu, 'mavros/imu/data',
             self._imu_callback, sensor_qos)
+        # isaac_joint_states publishes multiple messages per physics step.
+        # Use deeper queue to avoid dropping steps between callback processing.
+        joint_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=50,
+        )
         self.create_subscription(
             JointState, 'isaac_joint_states',
-            self._joint_state_callback, sensor_qos)
+            self._joint_state_callback, joint_qos)
         self.create_subscription(
-            Float64, 'camera/zoom',
-            self._zoom_callback, 10)
+            Float64, 'camera/zoom', self._zoom_callback, 10)
+        self.create_subscription(
+            Float32, 'zoom_cmd', self._zoom_cmd_callback, 10)
 
-        # -- Timer --
-        timer_period = 1.0 / self._update_rate
-        self.create_timer(timer_period, self._timer_callback)
+        # No timer — control loop runs in _joint_state_callback,
+        # triggered by isaac_joint_states at the sim physics rate.
 
         self.get_logger().info(
             f'LOS rate controller started: model={model}, '
             f'rate={self._update_rate} Hz, '
             f'max_gimbal_rate={math.degrees(self._max_gimbal_rate):.1f} deg/s, '
-            f'feedback_blend={self._feedback_blend}, '
-            f'control_mode={self._control_mode}')
+            f'pointing_gain={self._pointing_gain}, '
+            f'servo_rate_limit={math.degrees(self._servo_rate_limit):.1f} deg/s, '
+            f'control_mode={self._control_mode}, '
+            f'control_trigger={self._control_trigger}')
 
     # ------------------------------------------------------------------
     # Subscriber callbacks
     # ------------------------------------------------------------------
 
     def _los_rate_cmd_callback(self, msg: Vector3):
-        """Cache normalized LOS rate commands. x=azimuth, y=elevation, [-1,1]."""
+        """Cache normalized LOS rate commands. x=azimuth, y=elevation, [-1,1].
+
+        Positive elevation = up (ENU standard).
+        """
         self._cmd_az_rate = float(np.clip(msg.x, -1.0, 1.0))
         self._cmd_el_rate = float(np.clip(msg.y, -1.0, 1.0))
+        self._target_az_world = None
+        self._target_el_world = None
+
+    def _los_world_cmd_callback(self, msg: Vector3):
+        """Cache world-frame azimuth/elevation position target (degrees).
+
+        z=azimuth, y=elevation. Positive elevation = up.
+        """
+        self._target_az_world = math.radians(msg.z)
+        self._target_el_world = math.radians(msg.y)
+        self._cmd_az_rate = 0.0
+        self._cmd_el_rate = 0.0
 
     def _imu_callback(self, msg: Imu):
-        """Cache vehicle quaternion and body angular velocity."""
         q = msg.orientation
         self._vehicle_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
         av = msg.angular_velocity
         self._body_angular_velocity_b = np.array([av.x, av.y, av.z])
 
+        if self._control_trigger == 'imu':
+            self._run_control_loop_simtime(msg.header.stamp)
+
     def _zoom_callback(self, msg: Float64):
-        """Cache zoom level from sim camera/zoom topic."""
         self._zoom_level = float(msg.data)
 
+    def _zoom_cmd_callback(self, msg: Float32):
+        self._zoom_cmd_rate = float(np.clip(msg.data, -1.0, 1.0))
+
     def _joint_state_callback(self, msg: JointState):
-        """Parse and cache actual joint positions by name."""
+        """Parse and cache joint positions. Run control if trigger='joint_states'."""
         positions = {}
         yaw_name, roll_name, pitch_name = self._joint_names
         for i, name in enumerate(msg.name):
@@ -231,126 +340,232 @@ class LOSRateController(Node):
                 positions['roll'] = msg.position[i]
             elif name == pitch_name:
                 positions['pitch'] = msg.position[i]
-        if len(positions) == 3:
-            self._joint_positions_actual = positions
-
-    # ------------------------------------------------------------------
-    # Timer callback — main control loop
-    # ------------------------------------------------------------------
-
-    def _timer_callback(self):
-        """Compute and publish gimbal joint targets at update_rate Hz."""
-        if self._vehicle_quat_wxyz is None:
+        if len(positions) != 3:
             return
+        self._joint_positions_actual = positions
 
-        dt = 1.0 / self._update_rate
+        if self._control_trigger == 'joint_states':
+            # Dedup by sim timestamp: skip duplicate messages from same physics step
+            stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            if self._prev_time is not None and stamp_sec <= self._prev_time:
+                return
+            if self._vehicle_quat_wxyz is None:
+                return
+            if self._prev_time is None or stamp_sec <= 0.0:
+                self._prev_time = stamp_sec
+                dt = 1.0 / self._update_rate
+            else:
+                dt = stamp_sec - self._prev_time
+            self._prev_time = stamp_sec
+            self._run_control(dt)
 
-        # 1. Feedback blend: correct internal state drift from actual joints
-        if self._joint_positions_actual is not None and self._feedback_blend > 0.0:
-            actual_yaw = self._joint_positions_actual['yaw'] - YAW_JOINT_OFFSET
-            actual_roll = self._joint_positions_actual['roll']
-            actual_pitch = self._joint_positions_actual['pitch']
-            beta = self._feedback_blend
-            self._yaw += beta * (actual_yaw - self._yaw)
-            self._roll += beta * (actual_roll - self._roll)
-            self._pitch += beta * (actual_pitch - self._pitch)
+    def _run_control_loop_simtime(self, stamp):
+        """Run control loop using sim-time dt from message timestamp.
 
-        # 2. World-frame rate integration
-        az_rate = self._cmd_az_rate * self._max_gimbal_rate
-        el_rate = self._cmd_el_rate * self._max_gimbal_rate
-        self._azimuth_world += az_rate * dt
-        self._elevation_world += el_rate * dt
-        # Wrap azimuth to [-pi, pi]
-        self._azimuth_world = math.atan2(
-            math.sin(self._azimuth_world), math.cos(self._azimuth_world))
-        # Clamp elevation to pitch limits
-        self._elevation_world = float(np.clip(
-            self._elevation_world, self._pitch_limits[0], self._pitch_limits[1]))
+        dt is clamped to the nominal period (1/update_rate) so that K*dt
+        never exceeds the designed value, even when the message source
+        runs slower than expected (e.g. PX4 SITL IMU at ~20 Hz instead
+        of 250 Hz nominal).
+        """
+        if self._joint_positions_actual is None:
+            return
+        stamp_sec = stamp.sec + stamp.nanosec * 1e-9
+        if self._prev_time is None or stamp_sec <= 0.0:
+            self._prev_time = stamp_sec
+            dt = 1.0 / self._update_rate
+        else:
+            dt = stamp_sec - self._prev_time
+            if dt <= 0.0:
+                return
+        self._prev_time = stamp_sec
+        self._run_control(dt)
 
-        # 3. World-to-body angle conversion (LOS: 2-DOF)
-        yaw_new, pitch_new = self._world_to_body_angles(
-            self._azimuth_world, self._elevation_world, self._vehicle_quat_wxyz)
+    def _run_control(self, dt: float):
+        # Read actual joint angles
+        # iris_gimbal3 USD joint signs are inverted vs Jacobian/FK convention.
+        actual_yaw = self._joint_positions_actual['yaw'] - YAW_JOINT_OFFSET
+        actual_roll = -self._joint_positions_actual['roll']
+        actual_pitch = -self._joint_positions_actual['pitch']
 
-        # 4. Stabilizing roll (horizon: 1-DOF)
-        roll_new = self._compute_stabilizing_roll(yaw_new, self._vehicle_quat_wxyz)
+        if self._target_az_world is not None:
+            # ── Position mode (analytical IK for point_to_region) ────
+            az_world = self._target_az_world
+            el_world = self._target_el_world
 
-        # 5. Update state (save previous for finite-difference velocity)
-        self._yaw_prev = self._yaw
-        self._roll_prev = self._roll
-        self._pitch_prev = self._pitch
-        self._yaw = yaw_new
-        self._pitch = pitch_new
-        self._roll = roll_new
+            az_world = math.atan2(math.sin(az_world), math.cos(az_world))
+            el_world = float(np.clip(
+                el_world, self._pitch_limits[0], self._pitch_limits[1]))
 
-        # 6. Clamp to joint limits
-        self._yaw = float(np.clip(self._yaw, self._yaw_limits[0], self._yaw_limits[1]))
-        self._pitch = float(np.clip(self._pitch, self._pitch_limits[0], self._pitch_limits[1]))
-        self._roll = float(np.clip(self._roll, self._roll_limits[0], self._roll_limits[1]))
+            yaw_new, pitch_new = self._world_to_body_angles(
+                az_world, el_world, self._vehicle_quat_wxyz)
+            roll_new = self._compute_stabilizing_roll(
+                yaw_new, self._vehicle_quat_wxyz)
 
-        # 7. Publish
-        self._publish_joint_commands()
-        self._publish_state()
+            self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
+            self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
+            self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
+
+        else:
+            # ── Rate mode (analytical IK) ────────────────────────────
+            # Integrates world-frame LOS rate, then uses the same
+            # analytical IK as position mode (no Jacobian dynamics).
+            # This is algebraically stable at any gimbal yaw angle.
+
+            # Initialize world-frame target from current joints on first tick
+            if not self._az_world_initialized:
+                self._az_world, self._el_world = self._body_to_world_angles(
+                    actual_yaw, actual_pitch, self._vehicle_quat_wxyz)
+                self._az_world_initialized = True
+
+            # 1. Integrate LOS rate into persistent world-frame target
+            self._az_world += self._cmd_az_rate * self._max_gimbal_rate * dt
+            self._el_world += self._cmd_el_rate * self._max_gimbal_rate * dt
+            self._az_world = math.atan2(
+                math.sin(self._az_world), math.cos(self._az_world))
+            self._el_world = float(np.clip(
+                self._el_world, self._pitch_limits[0], self._pitch_limits[1]))
+
+            az_world = self._az_world
+            el_world = self._el_world
+
+            # 2. Analytical IK: world az/el → body yaw/pitch + stabilizing roll
+            yaw_new, pitch_new = self._world_to_body_angles(
+                az_world, el_world, self._vehicle_quat_wxyz)
+            roll_new = self._compute_stabilizing_roll(
+                yaw_new, self._vehicle_quat_wxyz)
+
+            self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
+            self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
+            self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
+
+            # --- Diagnostic logging (ticket #022) ---
+            self._diag_counter += 1
+            if self._diag_counter % 500 == 0:
+                q = self._vehicle_quat_wxyz
+                _broll = math.degrees(math.atan2(
+                    2*(q[0]*q[1]+q[2]*q[3]), 1-2*(q[1]*q[1]+q[2]*q[2])))
+                _bpitch = math.degrees(math.asin(
+                    max(-1, min(1, 2*(q[0]*q[2]-q[3]*q[1])))))
+                self.get_logger().info(
+                    f'[DIAG] dt={dt:.4f} '
+                    f'body=[{_broll:+.1f},{_bpitch:+.1f}] '
+                    f'act_r={math.degrees(actual_roll):+.1f} cmd_r={math.degrees(self._roll):+.1f} '
+                    f'act_p={math.degrees(actual_pitch):+.1f} cmd_p={math.degrees(self._pitch):+.1f} '
+                    f'az={math.degrees(az_world):+.1f} el={math.degrees(el_world):+.1f}'
+                )
+
+        # Publish
+        self._publish_joint_commands(dt)
+        self._publish_state(az_world, el_world, actual_yaw, actual_roll,
+                            actual_pitch, dt)
 
     # ------------------------------------------------------------------
-    # Analytical inverse kinematics (ported from iris_ma6)
+    # Jacobian-inverse math (ported from iris_ma6)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_desired_camera_quat(
+        az: float, el: float, q_body: np.ndarray,
+    ) -> np.ndarray:
+        """Desired camera orientation as body-frame quaternion (wxyz).
+
+        Camera frame: +X=forward (along LOS), +Z=up (horizon-stabilized).
+        """
+        fwd_world = np.array([
+            math.cos(el) * math.cos(az),
+            math.cos(el) * math.sin(az),
+            math.sin(el)])
+        world_up = np.array([0.0, 0.0, 1.0])
+
+        fwd_body = _quat_rotate_inverse(q_body, fwd_world)
+        up_body = _quat_rotate_inverse(q_body, world_up)
+
+        # Gram-Schmidt orthonormalization
+        cam_up = up_body - np.dot(up_body, fwd_body) * fwd_body
+        cam_up = cam_up / (np.linalg.norm(cam_up) + 1e-8)
+        cam_right = np.cross(cam_up, fwd_body)
+
+        R = np.column_stack([fwd_body, cam_right, cam_up])
+        return _rotmat_to_quat(R)
+
+    @staticmethod
+    def _gimbal_joints_to_quat(
+        yaw: float, roll: float, pitch: float,
+    ) -> np.ndarray:
+        """Joint angles → quaternion wxyz. Order: Yaw(Z) → Roll(X) → Pitch(Y)."""
+        q_yaw = _quat_from_euler_single(0, 0, yaw)
+        q_roll = _quat_from_euler_single(roll, 0, 0)
+        q_pitch = _quat_from_euler_single(0, pitch, 0)
+        return _quat_mul(_quat_mul(q_yaw, q_roll), q_pitch)
+
+    @staticmethod
+    def _jacobian_inv_times_omega(
+        omega: np.ndarray, gimbal_yaw: float, gimbal_roll: float,
+    ) -> np.ndarray:
+        """J^{-1} * omega for Yaw(Z)->Roll(X)->Pitch(Y) gimbal.
+
+        Returns [yaw_dot, roll_dot, pitch_dot].
+        """
+        cy, sy = math.cos(gimbal_yaw), math.sin(gimbal_yaw)
+        cr, sr = math.cos(gimbal_roll), math.sin(gimbal_roll)
+        inv_cr = 1.0 / (cr + 1e-6 * (1.0 if cr >= 0 else -1.0))
+
+        wx, wy, wz = omega
+        yaw_dot = sy * sr * inv_cr * wx - cy * sr * inv_cr * wy + wz
+        roll_dot = cy * wx + sy * wy
+        pitch_dot = -sy * inv_cr * wx + cy * inv_cr * wy
+        return np.array([yaw_dot, roll_dot, pitch_dot])
+
+    # ------------------------------------------------------------------
+    # Analytical IK (for position mode)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _body_to_world_angles(
+        yaw_body: float, pitch_body: float, q_wxyz: np.ndarray,
+    ) -> tuple[float, float]:
+        """Body-frame yaw/pitch → world-frame azimuth/elevation."""
+        cos_p, sin_p = math.cos(pitch_body), math.sin(pitch_body)
+        cos_y, sin_y = math.cos(yaw_body), math.sin(yaw_body)
+        dir_body = np.array([cos_p * cos_y, cos_p * sin_y, -sin_p])
+        dir_world = _quat_rotate(q_wxyz, dir_body)
+        az = math.atan2(dir_world[1], dir_world[0])
+        xy = math.sqrt(dir_world[0] ** 2 + dir_world[1] ** 2)
+        el = math.atan2(dir_world[2], xy)
+        return az, el
 
     @staticmethod
     def _world_to_body_angles(
         azimuth: float, elevation: float, q_wxyz: np.ndarray,
     ) -> tuple[float, float]:
-        """Convert world-frame pointing to body-frame yaw/pitch.
-
-        Projects world-frame target direction into body frame via q_body
-        inverse rotation, then extracts yaw and pitch via atan2.
-        """
-        cos_az = math.cos(azimuth)
-        sin_az = math.sin(azimuth)
-        cos_el = math.cos(elevation)
-        sin_el = math.sin(elevation)
-
-        dir_world = np.array([cos_el * cos_az, cos_el * sin_az, sin_el])
+        """World-frame azimuth/elevation → body-frame yaw/pitch."""
+        dir_world = np.array([
+            math.cos(elevation) * math.cos(azimuth),
+            math.cos(elevation) * math.sin(azimuth),
+            math.sin(elevation)])
         dir_body = _quat_rotate_inverse(q_wxyz, dir_world)
-
-        yaw_body = math.atan2(dir_body[1], dir_body[0])
-        xy_dist = math.sqrt(dir_body[0] ** 2 + dir_body[1] ** 2)
-        pitch_body = -math.atan2(dir_body[2], xy_dist)
-
-        return yaw_body, pitch_body
+        yaw = math.atan2(dir_body[1], dir_body[0])
+        xy = math.sqrt(dir_body[0] ** 2 + dir_body[1] ** 2)
+        pitch = -math.atan2(dir_body[2], xy)
+        return yaw, pitch
 
     @staticmethod
     def _compute_stabilizing_roll(
         gimbal_yaw: float, q_wxyz: np.ndarray,
     ) -> float:
-        """Compute roll to keep horizon level.
-
-        Projects world-up into the yawed gimbal frame and computes the roll
-        to align camera up-axis with projected world-up.
-        """
+        """Compute roll to keep horizon level (for position mode)."""
         world_up = np.array([0.0, 0.0, 1.0])
         up_in_body = _quat_rotate_inverse(q_wxyz, world_up)
-
-        cos_yaw = math.cos(gimbal_yaw)
-        sin_yaw = math.sin(gimbal_yaw)
-
+        cos_yaw, sin_yaw = math.cos(gimbal_yaw), math.sin(gimbal_yaw)
         up_y_yawed = -up_in_body[0] * sin_yaw + up_in_body[1] * cos_yaw
         up_z_yawed = up_in_body[2]
-
         return math.atan2(-up_y_yawed, up_z_yawed)
 
     # ------------------------------------------------------------------
     # Publishing
     # ------------------------------------------------------------------
 
-    def _publish_joint_commands(self):
-        """Publish joint commands with YAW_JOINT_OFFSET applied.
-
-        Control mode selects which JointState fields are populated:
-          position           — .position only (default)
-          position_velocity  — .position + .velocity (PD with feedforward)
-          velocity           — .velocity only (pure rate control)
-        """
-        dt = 1.0 / self._update_rate
+    def _publish_joint_commands(self, dt: float):
         msg = JointState()
         msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -358,13 +573,13 @@ class LOSRateController(Node):
 
         positions = [
             self._yaw + YAW_JOINT_OFFSET,
-            self._roll,
-            self._pitch,
+            -self._roll,   # negate: internal → USD
+            -self._pitch,  # negate: internal → USD
         ]
         velocities = [
-            (self._yaw - self._yaw_prev) / dt,
-            (self._roll - self._roll_prev) / dt,
-            (self._pitch - self._pitch_prev) / dt,
+            (self._yaw - self._prev_actual_yaw) / dt,
+            -(self._roll - self._prev_actual_roll) / dt,
+            -(self._pitch - self._prev_actual_pitch) / dt,
         ]
 
         if self._control_mode == 'position':
@@ -377,49 +592,29 @@ class LOSRateController(Node):
 
         self._cmd_pub.publish(msg)
 
-    def _publish_state(self):
-        """Publish gimbal state from actual joint feedback.
-
-        Uses actual joint positions (from isaac_joint_states) to match
-        real hardware encoder angles (0x26). Falls back to internal
-        targets if joint feedback is not yet available.
-        """
-        if self._joint_positions_actual is not None:
-            # Actual joint positions — matches real encoder output
-            yaw = self._joint_positions_actual['yaw'] - YAW_JOINT_OFFSET
-            roll = self._joint_positions_actual['roll']
-            pitch = self._joint_positions_actual['pitch']
-        else:
-            # Fallback to internal targets before joint feedback arrives
-            yaw = self._yaw
-            roll = self._roll
-            pitch = self._pitch
-
-        # Body-frame RPY in radians
-        rpy_rad = Vector3()
-        rpy_rad.x = roll
-        rpy_rad.y = pitch
-        rpy_rad.z = yaw
-        self._rpy_rad_pub.publish(rpy_rad)
-
-        # Body-frame RPY in degrees
+    def _publish_state(self, az_world: float, el_world: float,
+                       actual_yaw: float, actual_roll: float,
+                       actual_pitch: float, dt: float):
+        # Body-frame RPY in degrees for downstream Rz(yaw)*Rx(roll)*Ry(pitch).
+        # Roll: internal positive=CW(front), Rx positive=CCW(front) → publish as-is
+        #   (empirically verified: frustum roll matches camera image)
+        # Pitch: internal positive=down, Ry positive=up → negate
         rpy_deg = Vector3()
-        rpy_deg.x = math.degrees(roll)
-        rpy_deg.y = math.degrees(pitch)
-        rpy_deg.z = math.degrees(yaw)
+        rpy_deg.x = math.degrees(actual_roll)
+        rpy_deg.y = math.degrees(-actual_pitch)
+        rpy_deg.z = math.degrees(actual_yaw)
         self._rpy_deg_pub.publish(rpy_deg)
 
-        # World-frame azimuth/elevation
+        # World-frame LOS in degrees
         los = Vector3()
-        los.x = self._azimuth_world
-        los.y = self._elevation_world
+        los.x = math.degrees(az_world)
+        los.y = math.degrees(el_world)
         los.z = 0.0
         self._los_state_pub.publish(los)
 
         # Combined angular velocity (body + gimbal) in world frame
-        dt = 1.0 / self._update_rate
-        gimbal_yaw_rate = (self._yaw - self._yaw_prev) / dt
-        gimbal_pitch_rate = (self._pitch - self._pitch_prev) / dt
+        gimbal_yaw_rate = (actual_yaw - self._prev_actual_yaw) / dt
+        gimbal_pitch_rate = (actual_pitch - self._prev_actual_pitch) / dt
         gimbal_ang_vel_b = np.array([0.0, gimbal_pitch_rate, gimbal_yaw_rate])
         combined_b = self._body_angular_velocity_b + gimbal_ang_vel_b
         combined_w = _quat_rotate(self._vehicle_quat_wxyz, combined_b)
@@ -430,7 +625,19 @@ class LOSRateController(Node):
         cav_msg.vector.z = float(combined_w[2])
         self._combined_ang_vel_w_pub.publish(cav_msg)
 
-        # Zoom level
+        # Update previous actual positions
+        self._prev_actual_yaw = actual_yaw
+        self._prev_actual_roll = actual_roll
+        self._prev_actual_pitch = actual_pitch
+
+        # Zoom: integrate rate command and publish
+        if self._zoom_cmd_rate != 0.0:
+            self._zoom_level += self._zoom_cmd_rate * self._max_zoom_rate * dt
+            self._zoom_level = max(self._zoom_min, min(self._zoom_max, self._zoom_level))
+            cam_zoom_msg = Float64()
+            cam_zoom_msg.data = self._zoom_level
+            self._camera_zoom_pub.publish(cam_zoom_msg)
+
         zoom_msg = Float32()
         zoom_msg.data = float(self._zoom_level)
         self._zoom_level_pub.publish(zoom_msg)
