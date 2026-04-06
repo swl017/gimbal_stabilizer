@@ -58,7 +58,7 @@ def launch_setup(context):
                 'use_sim_time': True,
                 'vehicle_name': namespace,
                 'update_rate': vehicle.get('update_rate', 100.0),
-                'model': vehicle.get('model', 'cgo3'),
+                'model': vehicle.get('model', 'iris_gimbal3'),
                 **node_params
             }]
         )

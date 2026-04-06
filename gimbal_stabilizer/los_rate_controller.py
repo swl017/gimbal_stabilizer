@@ -54,6 +54,7 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Float32, Float64, Header
 
@@ -167,8 +168,7 @@ class LOSRateController(Node):
         self.declare_parameter('update_rate', 100.0)
         self.declare_parameter('model', 'iris_gimbal3')
         self.declare_parameter('control_mode', 'position')
-        self.declare_parameter('control_trigger', 'joint_states')  # "joint_states" or "imu"
-        self.declare_parameter('max_zoom_rate', 2.0)
+        self.declare_parameter('control_trigger', 'joint_states')  # "joint_states", "imu", or "clock"
         self.declare_parameter('zoom_min', 1.0)
         self.declare_parameter('zoom_max', 30.0)
         self.declare_parameter('servo_rate_limit', 0.0)  # 0 = use max_gimbal_rate
@@ -223,7 +223,6 @@ class LOSRateController(Node):
         # -- Zoom state --
         self._zoom_level: float = 1.0
         self._zoom_cmd_rate = 0.0
-        self._max_zoom_rate = float(self.get_parameter('max_zoom_rate').value or 2.0)
         self._zoom_min = float(self.get_parameter('zoom_min').value or 1.0)
         self._zoom_max = float(self.get_parameter('zoom_max').value or 30.0)
         servo_lim = float(self.get_parameter('servo_rate_limit').value or 0.0)
@@ -249,8 +248,8 @@ class LOSRateController(Node):
         self._combined_ang_vel_w_pub = self.create_publisher(
             Vector3Stamped, 'combined_ang_vel_w', sensor_qos)
         self._zoom_level_pub = self.create_publisher(
-            Float32, 'zoom_level', sensor_qos)
-        self._camera_zoom_pub = self.create_publisher(Float64, 'camera/zoom', 10)
+            Float64, 'camera/zoom_level', sensor_qos)
+        self._camera_zoom_cmd_pub = self.create_publisher(Float64, 'camera/zoom_level_cmd', 10)
 
         # -- Subscribers --
         self.create_subscription(
@@ -274,9 +273,11 @@ class LOSRateController(Node):
             JointState, 'isaac_joint_states',
             self._joint_state_callback, joint_qos)
         self.create_subscription(
-            Float64, 'camera/zoom', self._zoom_callback, 10)
+            Float32, 'zoom_rate_cmd', self._zoom_rate_cmd_callback, 10)
         self.create_subscription(
-            Float32, 'zoom_cmd', self._zoom_cmd_callback, 10)
+            Float64, 'zoom_level_set', self._zoom_level_set_callback, 10)
+        self.create_subscription(
+            Clock, '/clock', self._clock_callback, sensor_qos)
 
         # No timer — control loop runs in _joint_state_callback,
         # triggered by isaac_joint_states at the sim physics rate.
@@ -295,12 +296,12 @@ class LOSRateController(Node):
     # ------------------------------------------------------------------
 
     def _los_rate_cmd_callback(self, msg: Vector3):
-        """Cache normalized LOS rate commands. x=azimuth, y=elevation, [-1,1].
+        """Cache LOS rate commands in rad/s. x=azimuth, y=elevation.
 
         Positive elevation = up (ENU standard).
         """
-        self._cmd_az_rate = float(np.clip(msg.x, -1.0, 1.0))
-        self._cmd_el_rate = float(np.clip(msg.y, -1.0, 1.0))
+        self._cmd_az_rate = float(msg.x)
+        self._cmd_el_rate = float(msg.y)
         self._target_az_world = None
         self._target_el_world = None
 
@@ -323,11 +324,26 @@ class LOSRateController(Node):
         if self._control_trigger == 'imu':
             self._run_control_loop_simtime(msg.header.stamp)
 
-    def _zoom_callback(self, msg: Float64):
-        self._zoom_level = float(msg.data)
+    def _clock_callback(self, msg: Clock):
+        if self._control_trigger == 'clock' and \
+            self._vehicle_quat_wxyz is not None and \
+            self._body_angular_velocity_b is not None:
+            self._run_control_loop_simtime(msg.clock)
 
-    def _zoom_cmd_callback(self, msg: Float32):
-        self._zoom_cmd_rate = float(np.clip(msg.data, -1.0, 1.0))
+    def _zoom_rate_cmd_callback(self, msg: Float32):
+        self._zoom_cmd_rate = float(msg.data)
+
+    def _zoom_level_set_callback(self, msg: Float64):
+        """Set zoom level directly (e.g., reset to 1.0 on IDLE)."""
+        level = float(msg.data)
+        level = max(self._zoom_min, min(self._zoom_max, level))
+        self._zoom_level = level
+        self._zoom_cmd_rate = 0.0
+        # Publish immediately to sim camera
+        cam_msg = Float64()
+        cam_msg.data = self._zoom_level
+        self._camera_zoom_cmd_pub.publish(cam_msg)
+        self.get_logger().info(f'Zoom level set to {self._zoom_level:.1f}')
 
     def _joint_state_callback(self, msg: JointState):
         """Parse and cache joint positions. Run control if trigger='joint_states'."""
@@ -375,7 +391,7 @@ class LOSRateController(Node):
             dt = 1.0 / self._update_rate
         else:
             dt = stamp_sec - self._prev_time
-            if dt <= 0.0:
+            if dt < 1.0 / self._update_rate:
                 return
         self._prev_time = stamp_sec
         self._run_control(dt)
@@ -417,9 +433,9 @@ class LOSRateController(Node):
                     actual_yaw, actual_pitch, self._vehicle_quat_wxyz)
                 self._az_world_initialized = True
 
-            # 1. Integrate LOS rate into persistent world-frame target
-            self._az_world += self._cmd_az_rate * self._max_gimbal_rate * dt
-            self._el_world += self._cmd_el_rate * self._max_gimbal_rate * dt
+            # 1. Integrate LOS rate (rad/s) into persistent world-frame target
+            self._az_world += self._cmd_az_rate * dt
+            self._el_world += self._cmd_el_rate * dt
             self._az_world = math.atan2(
                 math.sin(self._az_world), math.cos(self._az_world))
             self._el_world = float(np.clip(
@@ -439,20 +455,20 @@ class LOSRateController(Node):
             self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
 
             # --- Diagnostic logging (ticket #022) ---
-            self._diag_counter += 1
-            if self._diag_counter % 500 == 0:
-                q = self._vehicle_quat_wxyz
-                _broll = math.degrees(math.atan2(
-                    2*(q[0]*q[1]+q[2]*q[3]), 1-2*(q[1]*q[1]+q[2]*q[2])))
-                _bpitch = math.degrees(math.asin(
-                    max(-1, min(1, 2*(q[0]*q[2]-q[3]*q[1])))))
-                self.get_logger().info(
-                    f'[DIAG] dt={dt:.4f} '
-                    f'body=[{_broll:+.1f},{_bpitch:+.1f}] '
-                    f'act_r={math.degrees(actual_roll):+.1f} cmd_r={math.degrees(self._roll):+.1f} '
-                    f'act_p={math.degrees(actual_pitch):+.1f} cmd_p={math.degrees(self._pitch):+.1f} '
-                    f'az={math.degrees(az_world):+.1f} el={math.degrees(el_world):+.1f}'
-                )
+            # self._diag_counter += 1
+            # if self._diag_counter % 500 == 0:
+            #     q = self._vehicle_quat_wxyz
+            #     _broll = math.degrees(math.atan2(
+            #         2*(q[0]*q[1]+q[2]*q[3]), 1-2*(q[1]*q[1]+q[2]*q[2])))
+            #     _bpitch = math.degrees(math.asin(
+            #         max(-1, min(1, 2*(q[0]*q[2]-q[3]*q[1])))))
+            #     self.get_logger().info(
+            #         f'[DIAG] dt={dt:.4f} '
+            #         f'body=[{_broll:+.1f},{_bpitch:+.1f}] '
+            #         f'act_r={math.degrees(actual_roll):+.1f} cmd_r={math.degrees(self._roll):+.1f} '
+            #         f'act_p={math.degrees(actual_pitch):+.1f} cmd_p={math.degrees(self._pitch):+.1f} '
+            #         f'az={math.degrees(az_world):+.1f} el={math.degrees(el_world):+.1f}'
+            #     )
 
         # Publish
         self._publish_joint_commands(dt)
@@ -598,10 +614,11 @@ class LOSRateController(Node):
         # Body-frame RPY in degrees for downstream Rz(yaw)*Rx(roll)*Ry(pitch).
         # Roll: internal positive=CW(front), Rx positive=CCW(front) → publish as-is
         #   (empirically verified: frustum roll matches camera image)
-        # Pitch: internal positive=down, Ry positive=up → negate
+        # If -actual_pitch: Pitch: internal positive=down, Ry positive=up → negate
+        # If actual_pitch: Pitch: internal positive=down, Ry positive=down → as-is
         rpy_deg = Vector3()
         rpy_deg.x = math.degrees(actual_roll)
-        rpy_deg.y = math.degrees(-actual_pitch)
+        rpy_deg.y = math.degrees(actual_pitch)
         rpy_deg.z = math.degrees(actual_yaw)
         self._rpy_deg_pub.publish(rpy_deg)
 
@@ -612,10 +629,23 @@ class LOSRateController(Node):
         los.z = 0.0
         self._los_state_pub.publish(los)
 
-        # Combined angular velocity (body + gimbal) in world frame
+        # Combined angular velocity (body + gimbal) in world frame.
+        # Uses full ZXY Jacobian matching training env
+        # (derived_field_computers.py:compute_combined_angular_velocity).
+        # Gimbal chain: Yaw(Z) -> Roll(X) -> Pitch(Y)
+        # omega_gimbal_b = yaw_rate*[0,0,1]
+        #   + roll_rate * Rz(yaw) @ [1,0,0]
+        #   + pitch_rate * Rz(yaw) @ Rx(roll) @ [0,1,0]
         gimbal_yaw_rate = (actual_yaw - self._prev_actual_yaw) / dt
+        gimbal_roll_rate = (actual_roll - self._prev_actual_roll) / dt
         gimbal_pitch_rate = (actual_pitch - self._prev_actual_pitch) / dt
-        gimbal_ang_vel_b = np.array([0.0, gimbal_pitch_rate, gimbal_yaw_rate])
+        cy, sy = math.cos(actual_yaw), math.sin(actual_yaw)
+        cr, sr = math.cos(actual_roll), math.sin(actual_roll)
+        gimbal_ang_vel_b = np.array([
+            -sy * cr * gimbal_pitch_rate + cy * gimbal_roll_rate,   # X
+             cy * cr * gimbal_pitch_rate + sy * gimbal_roll_rate,   # Y
+             sr * gimbal_pitch_rate + gimbal_yaw_rate,              # Z
+        ])
         combined_b = self._body_angular_velocity_b + gimbal_ang_vel_b
         combined_w = _quat_rotate(self._vehicle_quat_wxyz, combined_b)
         cav_msg = Vector3Stamped()
@@ -630,17 +660,17 @@ class LOSRateController(Node):
         self._prev_actual_roll = actual_roll
         self._prev_actual_pitch = actual_pitch
 
-        # Zoom: integrate rate command and publish
+        # Zoom: integrate rate command (already in zoom-levels/s) and publish
         if self._zoom_cmd_rate != 0.0:
-            self._zoom_level += self._zoom_cmd_rate * self._max_zoom_rate * dt
+            self._zoom_level += self._zoom_cmd_rate * dt
             self._zoom_level = max(self._zoom_min, min(self._zoom_max, self._zoom_level))
-            cam_zoom_msg = Float64()
-            cam_zoom_msg.data = self._zoom_level
-            self._camera_zoom_pub.publish(cam_zoom_msg)
+            cam_zoom_cmd_msg = Float64()
+            cam_zoom_cmd_msg.data = self._zoom_level
+            self._camera_zoom_cmd_pub.publish(cam_zoom_cmd_msg)
 
-        zoom_msg = Float32()
-        zoom_msg.data = float(self._zoom_level)
-        self._zoom_level_pub.publish(zoom_msg)
+        zoom_level_msg = Float64()
+        zoom_level_msg.data = self._zoom_level
+        self._zoom_level_pub.publish(zoom_level_msg)
 
 
 def main(args=None):

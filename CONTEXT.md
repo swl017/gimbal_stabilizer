@@ -55,20 +55,19 @@ World-frame LOS (Line-of-Sight) gimbal controller for RL policy deployment. Port
 - **Position mode**: Accepts world-frame azimuth/elevation position targets (from gimbal_los_tracker), computes body-frame joints via analytical atan2 IK.
 
 ## Subscriptions
-- `gimbal_cmd_los_rate` (`geometry_msgs/msg/Vector3`) — normalized LOS rate commands: x=azimuth_rate, y=elevation_rate [-1,1] (rate mode)
+- `gimbal_cmd_los_rate` (`geometry_msgs/msg/Vector3`) — LOS rate commands in rad/s: x=azimuth_rate, y=elevation_rate (rate mode)
 - `gimbal_cmd_los_world_deg` (`geometry_msgs/msg/Vector3`) — world-frame position target: z=azimuth, y=elevation [deg] (position mode)
 - `mavros/imu/data` (`sensor_msgs/msg/Imu`) — vehicle IMU (quaternion + angular velocity for stabilization)
 - `isaac_joint_states` (`sensor_msgs/msg/JointState`) — actual joint positions (feedback)
-- `camera/zoom` (`std_msgs/msg/Float64`) — sim camera zoom level
-- `zoom_cmd` (`std_msgs/msg/Float32`) — normalized zoom rate command [-1,1]
+- `zoom_rate_cmd` (`std_msgs/msg/Float32`) — zoom rate command in zoom-levels/s
 
 ## Publishers
 - `isaac_joint_commands` (`sensor_msgs/msg/JointState`) — joint targets (position and/or velocity)
 - `gimbal_state_rpy_deg` (`geometry_msgs/msg/Vector3`) — actual body-frame RPY in degrees (from joint feedback)
 - `gimbal_los_state_deg` (`geometry_msgs/msg/Vector3`) — world-frame azimuth (x) / elevation (y) in degrees
 - `combined_ang_vel_w` (`geometry_msgs/msg/Vector3Stamped`) — body + gimbal angular velocity in world frame
-- `zoom_level` (`std_msgs/msg/Float32`) — current zoom level
-- `camera/zoom` (`std_msgs/msg/Float64`) — sim camera zoom command
+- `camera/zoom_level` (`std_msgs/msg/Float64`) — current zoom level state
+- `camera/zoom_level_cmd` (`std_msgs/msg/Float64`) — zoom level command to sim camera
 
 ## Parameters
 - `model` (`string`, default: `iris_gimbal3`) — gimbal model, selects joint name mapping

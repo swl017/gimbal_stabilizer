@@ -7,4 +7,4 @@ los_rate_controller:
   control_mode: "position_velocity"  # "position", "position_velocity", or "velocity"
   pointing_gain: 32.5  # matches iris_ma6 training (K*dt=0.325 at 100Hz physics rate)
   servo_rate_limit: 0.0  # max body-frame omega_cmd [rad/s] before J^{-1}. 0 = use max_gimbal_rate (π). Prevents overshoot with delayed sim feedback.
-  control_trigger: "imu"  # "joint_states" has dedup issues. "imu" is ~20 Hz sim-time.
+  control_trigger: "clock"  # "joint_states", "imu", or "clock"
