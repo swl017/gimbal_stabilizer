@@ -1,10 +1,10 @@
 los_rate_controller:
   max_gimbal_rate: 3.141593  # pi rad/s (180 deg/s) — matches iris_ma6 training env
-  yaw_limits_deg: [-270.0, 270.0]
+  yaw_limits_deg: [-180.0, 180.0]
   pitch_limits_deg: [-45.0, 45.0]
   roll_limits_deg: [-45.0, 45.0]
   feedback_blend: 0.05  # drift correction (0.0 for direct joint state writing)
   control_mode: "position_velocity"  # "position", "position_velocity", or "velocity"
   pointing_gain: 32.5  # matches iris_ma6 training (K*dt=0.325 at 100Hz physics rate)
-  servo_rate_limit: 0.0  # max body-frame omega_cmd [rad/s] before J^{-1}. 0 = use max_gimbal_rate (π). Prevents overshoot with delayed sim feedback.
+  servo_rate_limit: 6.0  # max body-frame omega_cmd [rad/s] before J^{-1}. 0 = use max_gimbal_rate (π). Prevents overshoot with delayed sim feedback.
   control_trigger: "clock"  # "joint_states", "imu", or "clock"

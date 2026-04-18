@@ -39,6 +39,7 @@ def get_config(context):
 
 def launch_setup(context):
     vehicles_config, los_rate_params = get_config(context)
+    gimbal_controller_mode = LaunchConfiguration('gimbal_controller_mode').perform(context)
     nodes = []
 
     for vehicle in vehicles_config['vehicles']:
@@ -48,6 +49,9 @@ def launch_setup(context):
         node_params = los_rate_params['los_rate_controller'].copy()
         if 'los_rate' in vehicle:
             node_params.update(vehicle['los_rate'])
+        # CLI argument overrides config file
+        if gimbal_controller_mode:
+            node_params['gimbal_controller_mode'] = gimbal_controller_mode
 
         node = Node(
             package='gimbal_stabilizer',
@@ -78,6 +82,11 @@ def generate_launch_description():
             'los_rate_config',
             default_value='config/los_rate_config.yaml',
             description='Path to the LOS rate controller configuration file'
+        ),
+        DeclareLaunchArgument(
+            'gimbal_controller_mode',
+            default_value='',
+            description='Gimbal controller mode: "analytical" or "jacobian" (overrides config file, empty = use config)'
         ),
         OpaqueFunction(function=launch_setup)
     ])

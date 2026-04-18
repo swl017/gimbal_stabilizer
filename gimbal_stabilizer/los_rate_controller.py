@@ -162,16 +162,17 @@ class LOSRateController(Node):
         # -- Declare parameters --
         self.declare_parameter('max_gimbal_rate', math.pi)
         self.declare_parameter('pointing_gain', 32.5)
-        self.declare_parameter('yaw_limits_deg', [-160.0, 160.0])
+        self.declare_parameter('yaw_limits_deg', [-45.0, 45.0])
         self.declare_parameter('pitch_limits_deg', [-45.0, 45.0])
         self.declare_parameter('roll_limits_deg', [-45.0, 45.0])
-        self.declare_parameter('update_rate', 100.0)
+        self.declare_parameter('update_rate', 250.0)
         self.declare_parameter('model', 'iris_gimbal3')
         self.declare_parameter('control_mode', 'position')
         self.declare_parameter('control_trigger', 'joint_states')  # "joint_states", "imu", or "clock"
         self.declare_parameter('zoom_min', 1.0)
-        self.declare_parameter('zoom_max', 30.0)
-        self.declare_parameter('servo_rate_limit', 0.0)  # 0 = use max_gimbal_rate
+        self.declare_parameter('zoom_max', 6.0)
+        self.declare_parameter('servo_rate_limit', 18*math.pi)  # 0 = use max_gimbal_rate
+        self.declare_parameter('gimbal_controller_mode', 'analytical')  # "analytical" or "jacobian"
 
         self._max_gimbal_rate = self.get_parameter('max_gimbal_rate').value
         self._pointing_gain = self.get_parameter('pointing_gain').value
@@ -197,6 +198,8 @@ class LOSRateController(Node):
         self._yaw = 0.0
         self._roll = 0.0
         self._pitch = 0.0
+        # Jacobian-computed joint velocities (used by combined mode)
+        self._qdot: np.ndarray | None = None
         # Persistent world-frame LOS target (rate mode integrates into this)
         self._az_world = 0.0
         self._el_world = 0.0
@@ -225,8 +228,9 @@ class LOSRateController(Node):
         self._zoom_cmd_rate = 0.0
         self._zoom_min = float(self.get_parameter('zoom_min').value or 1.0)
         self._zoom_max = float(self.get_parameter('zoom_max').value or 30.0)
-        servo_lim = float(self.get_parameter('servo_rate_limit').value or 0.0)
+        servo_lim = float(self.get_parameter('servo_rate_limit').value or 6*math.pi)
         self._servo_rate_limit = servo_lim if servo_lim > 0 else self._max_gimbal_rate
+        self._gimbal_controller_mode = self.get_parameter('gimbal_controller_mode').value
 
         # -- QoS profiles --
         sensor_qos = QoSProfile(
@@ -289,7 +293,8 @@ class LOSRateController(Node):
             f'pointing_gain={self._pointing_gain}, '
             f'servo_rate_limit={math.degrees(self._servo_rate_limit):.1f} deg/s, '
             f'control_mode={self._control_mode}, '
-            f'control_trigger={self._control_trigger}')
+            f'control_trigger={self._control_trigger}, '
+            f'gimbal_controller_mode={self._gimbal_controller_mode}')
 
     # ------------------------------------------------------------------
     # Subscriber callbacks
@@ -422,10 +427,7 @@ class LOSRateController(Node):
             self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
 
         else:
-            # ── Rate mode (analytical IK) ────────────────────────────
-            # Integrates world-frame LOS rate, then uses the same
-            # analytical IK as position mode (no Jacobian dynamics).
-            # This is algebraically stable at any gimbal yaw angle.
+            # ── Rate mode ────────────────────────────────────────────
 
             # Initialize world-frame target from current joints on first tick
             if not self._az_world_initialized:
@@ -433,47 +435,151 @@ class LOSRateController(Node):
                     actual_yaw, actual_pitch, self._vehicle_quat_wxyz)
                 self._az_world_initialized = True
 
-            # 1. Integrate LOS rate (rad/s) into persistent world-frame target
-            self._az_world += self._cmd_az_rate * dt
-            self._el_world += self._cmd_el_rate * dt
-            self._az_world = math.atan2(
-                math.sin(self._az_world), math.cos(self._az_world))
-            self._el_world = float(np.clip(
-                self._el_world, self._pitch_limits[0], self._pitch_limits[1]))
+            # 1. Integrate LOS rate into candidate world-frame target
+            az_candidate = self._az_world + self._cmd_az_rate * dt
+            el_candidate = self._el_world + self._cmd_el_rate * dt
+            az_candidate = math.atan2(math.sin(az_candidate), math.cos(az_candidate))
+            el_candidate = float(np.clip(
+                el_candidate, self._pitch_limits[0], self._pitch_limits[1]))
+
+            # Anti-windup: accept azimuth and elevation independently.
+            # If azimuth update would push yaw joint out of limits, reject
+            # only the azimuth change. Same for elevation/pitch. This
+            # prevents one saturated axis from freezing the other.
+            yaw_az, pitch_az = self._world_to_body_angles(
+                az_candidate, self._el_world, self._vehicle_quat_wxyz)
+            if self._yaw_limits[0] <= yaw_az <= self._yaw_limits[1]:
+                self._az_world = az_candidate
+
+            yaw_el, pitch_el = self._world_to_body_angles(
+                self._az_world, el_candidate, self._vehicle_quat_wxyz)
+            if self._pitch_limits[0] <= pitch_el <= self._pitch_limits[1]:
+                self._el_world = el_candidate
 
             az_world = self._az_world
             el_world = self._el_world
 
-            # 2. Analytical IK: world az/el → body yaw/pitch + stabilizing roll
-            yaw_new, pitch_new = self._world_to_body_angles(
-                az_world, el_world, self._vehicle_quat_wxyz)
-            roll_new = self._compute_stabilizing_roll(
-                yaw_new, self._vehicle_quat_wxyz)
-
-            self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
-            self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
-            self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
-
-            # --- Diagnostic logging (ticket #022) ---
-            # self._diag_counter += 1
-            # if self._diag_counter % 500 == 0:
-            #     q = self._vehicle_quat_wxyz
-            #     _broll = math.degrees(math.atan2(
-            #         2*(q[0]*q[1]+q[2]*q[3]), 1-2*(q[1]*q[1]+q[2]*q[2])))
-            #     _bpitch = math.degrees(math.asin(
-            #         max(-1, min(1, 2*(q[0]*q[2]-q[3]*q[1])))))
-            #     self.get_logger().info(
-            #         f'[DIAG] dt={dt:.4f} '
-            #         f'body=[{_broll:+.1f},{_bpitch:+.1f}] '
-            #         f'act_r={math.degrees(actual_roll):+.1f} cmd_r={math.degrees(self._roll):+.1f} '
-            #         f'act_p={math.degrees(actual_pitch):+.1f} cmd_p={math.degrees(self._pitch):+.1f} '
-            #         f'az={math.degrees(az_world):+.1f} el={math.degrees(el_world):+.1f}'
-            #     )
+            if self._gimbal_controller_mode == 'jacobian':
+                # Jacobian J^{-1} controller (matching iris_ma6 training).
+                # Uses quaternion error → proportional rate → J^{-1} → joint rates.
+                # Includes body-rate feedforward for disturbance rejection.
+                # Position targets: actual + qdot * dt (Jacobian-integrated).
+                # Velocity targets: qdot (Jacobian).
+                self._run_jacobian_ik(
+                    az_world, el_world, actual_yaw, actual_roll, actual_pitch, dt)
+            elif self._gimbal_controller_mode == 'combined':
+                # Analytical position + Jacobian velocity (best of both worlds).
+                # Position: exact atan2 IK (no tracking dynamics, no drift).
+                # Velocity: J^{-1} feedforward (body-rate rejection + pointing rate).
+                # The actuator PD tracks the exact position while the velocity
+                # feedforward improves transient response and disturbance rejection.
+                self._run_combined_ik(
+                    az_world, el_world, actual_yaw, actual_roll, actual_pitch, dt)
+            else:
+                # Analytical IK: world az/el → body yaw/pitch + stabilizing roll.
+                # Algebraically stable at any gimbal yaw angle — no dynamics.
+                yaw_new, pitch_new = self._world_to_body_angles(
+                    az_world, el_world, self._vehicle_quat_wxyz)
+                roll_new = self._compute_stabilizing_roll(
+                    yaw_new, self._vehicle_quat_wxyz)
+                self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
+                self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
+                self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
 
         # Publish
         self._publish_joint_commands(dt)
         self._publish_state(az_world, el_world, actual_yaw, actual_roll,
                             actual_pitch, dt)
+
+    def _run_jacobian_ik(
+        self, az_world: float, el_world: float,
+        actual_yaw: float, actual_roll: float, actual_pitch: float,
+        dt: float,
+    ):
+        """Jacobian J^{-1} controller (matching iris_ma6 training).
+
+        Algorithm:
+          1. Compute desired camera quaternion from world-frame az/el
+          2. Quaternion error: q_err = q_current * q_desired^{-1}
+             (axis in body/current frame, NOT desired frame)
+          3. omega_cmd = -K * att_error, rate-limited by servo_rate_limit
+          4. qdot = J^{-1} * (omega_cmd - omega_body)
+          5. target = actual + qdot * dt
+        """
+        # Desired camera quaternion in body frame
+        q_desired = self._compute_desired_camera_quat(
+            az_world, el_world, self._vehicle_quat_wxyz)
+
+        # Current gimbal quaternion from actual joints
+        q_current = self._gimbal_joints_to_quat(
+            actual_yaw, actual_roll, actual_pitch)
+
+        # Quaternion error — axis in current/body frame (fixed bug from iris_ma6)
+        # q_err = q_current * q_desired^{-1}  (NOT q_desired^{-1} * q_current)
+        q_err = _quat_mul(q_current, _quat_inv(q_desired))
+        sign_w = 1.0 if q_err[0] >= 0 else -1.0
+        att_error = 2.0 * sign_w * q_err[1:4]  # body-frame angular error
+
+        # Pointing rate command with servo rate limiting
+        omega_cmd = -self._pointing_gain * att_error
+        omega_cmd = np.clip(omega_cmd, -self._servo_rate_limit, self._servo_rate_limit)
+
+        # J^{-1} * (omega_cmd - omega_body)
+        omega_combined = omega_cmd - self._body_angular_velocity_b
+        self._qdot = self._jacobian_inv_times_omega(
+            omega_combined, actual_yaw, actual_roll)
+
+        # Position target = actual + joint rates * dt
+        self._yaw = float(np.clip(
+            actual_yaw + self._qdot[0] * dt,
+            self._yaw_limits[0], self._yaw_limits[1]))
+        self._roll = float(np.clip(
+            actual_roll + self._qdot[1] * dt,
+            self._roll_limits[0], self._roll_limits[1]))
+        self._pitch = float(np.clip(
+            actual_pitch + self._qdot[2] * dt,
+            self._pitch_limits[0], self._pitch_limits[1]))
+
+    def _run_combined_ik(
+        self, az_world: float, el_world: float,
+        actual_yaw: float, actual_roll: float, actual_pitch: float,
+        dt: float,
+    ):
+        """Combined analytical position + Jacobian velocity targets.
+
+        Position: exact atan2 IK — no tracking dynamics, no drift.
+        Velocity: J^{-1}(omega_cmd - omega_body) — body-rate feedforward
+                  for fast disturbance rejection during maneuvers.
+
+        The actuator PD tracks the exact position target while the velocity
+        feedforward reduces phase lag on transients.
+        """
+        # Position targets from analytical IK (exact, same as 'analytical' mode)
+        yaw_new, pitch_new = self._world_to_body_angles(
+            az_world, el_world, self._vehicle_quat_wxyz)
+        roll_new = self._compute_stabilizing_roll(
+            yaw_new, self._vehicle_quat_wxyz)
+
+        self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
+        self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
+        self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
+
+        # Velocity targets from Jacobian (feedforward)
+        q_desired = self._compute_desired_camera_quat(
+            az_world, el_world, self._vehicle_quat_wxyz)
+        q_current = self._gimbal_joints_to_quat(
+            actual_yaw, actual_roll, actual_pitch)
+
+        q_err = _quat_mul(q_current, _quat_inv(q_desired))
+        sign_w = 1.0 if q_err[0] >= 0 else -1.0
+        att_error = 2.0 * sign_w * q_err[1:4]
+
+        omega_cmd = -self._pointing_gain * att_error
+        # omega_cmd = np.clip(omega_cmd, -self._servo_rate_limit, self._servo_rate_limit)
+
+        omega_combined = omega_cmd - self._body_angular_velocity_b
+        self._qdot = self._jacobian_inv_times_omega(
+            omega_combined, actual_yaw, actual_roll)
 
     # ------------------------------------------------------------------
     # Jacobian-inverse math (ported from iris_ma6)
@@ -592,11 +698,21 @@ class LOSRateController(Node):
             -self._roll,   # negate: internal → USD
             -self._pitch,  # negate: internal → USD
         ]
-        velocities = [
-            (self._yaw - self._prev_actual_yaw) / dt,
-            -(self._roll - self._prev_actual_roll) / dt,
-            -(self._pitch - self._prev_actual_pitch) / dt,
-        ]
+        if self._qdot is not None:
+            # Jacobian-computed velocities (combined/jacobian mode)
+            velocities = [
+                float(self._qdot[0]),
+                float(-self._qdot[1]),  # negate: internal → USD
+                float(-self._qdot[2]),  # negate: internal → USD
+            ]
+            self._qdot = None  # consumed
+        else:
+            # Finite-difference fallback (analytical mode)
+            velocities = [
+                (self._yaw - self._prev_actual_yaw) / dt,
+                -(self._roll - self._prev_actual_roll) / dt,
+                -(self._pitch - self._prev_actual_pitch) / dt,
+            ]
 
         if self._control_mode == 'position':
             msg.position = positions
