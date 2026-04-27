@@ -46,7 +46,7 @@ import math
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Vector3, Vector3Stamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, Vector3, Vector3Stamped
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -171,8 +171,13 @@ class LOSRateController(Node):
         self.declare_parameter('control_trigger', 'joint_states')  # "joint_states", "imu", or "clock"
         self.declare_parameter('zoom_min', 1.0)
         self.declare_parameter('zoom_max', 6.0)
-        self.declare_parameter('servo_rate_limit', 18*math.pi)  # 0 = use max_gimbal_rate
-        self.declare_parameter('gimbal_controller_mode', 'analytical')  # "analytical" or "jacobian"
+        self.declare_parameter('servo_rate_limit', 56.5)  # 0 = use max_gimbal_rate
+        self.declare_parameter('gimbal_controller_mode', 'jacobian')  # "analytical" or "jacobian"
+        # "mavros": /mavros/imu/data (PX4 EKF2, wall-clock, lagged).
+        # "state": /state/pose + /state/twist from PegasusSimulator ROS2Backend
+        #          (ground truth, sim-time stamped). Pegasus publishes orientation
+        #          as xyzw and body-frame angular velocity in twist.angular.
+        self.declare_parameter('imu_source', 'mavros')
 
         self._max_gimbal_rate = self.get_parameter('max_gimbal_rate').value
         self._pointing_gain = self.get_parameter('pointing_gain').value
@@ -231,6 +236,11 @@ class LOSRateController(Node):
         servo_lim = float(self.get_parameter('servo_rate_limit').value or 6*math.pi)
         self._servo_rate_limit = servo_lim if servo_lim > 0 else self._max_gimbal_rate
         self._gimbal_controller_mode = self.get_parameter('gimbal_controller_mode').value
+        self._imu_source = self.get_parameter('imu_source').value
+        if self._imu_source not in ('mavros', 'state'):
+            raise ValueError(
+                f"Unknown imu_source '{self._imu_source}'. "
+                f"Supported: 'mavros', 'state'")
 
         # -- QoS profiles --
         sensor_qos = QoSProfile(
@@ -262,9 +272,17 @@ class LOSRateController(Node):
         self.create_subscription(
             Vector3, 'gimbal_cmd_los_world_deg',
             self._los_world_cmd_callback, reliable_qos)
-        self.create_subscription(
-            Imu, 'mavros/imu/data',
-            self._imu_callback, sensor_qos)
+        if self._imu_source == 'mavros':
+            self.create_subscription(
+                Imu, 'mavros/imu/data',
+                self._imu_callback, sensor_qos)
+        else:
+            self.create_subscription(
+                PoseStamped, 'state/pose',
+                self._pose_callback, sensor_qos)
+            self.create_subscription(
+                TwistStamped, 'state/twist',
+                self._twist_callback, sensor_qos)
         # isaac_joint_states publishes multiple messages per physics step.
         # Use deeper queue to avoid dropping steps between callback processing.
         joint_qos = QoSProfile(
@@ -328,6 +346,19 @@ class LOSRateController(Node):
 
         if self._control_trigger == 'imu':
             self._run_control_loop_simtime(msg.header.stamp)
+
+    def _pose_callback(self, msg: PoseStamped):
+        # Pegasus publishes orientation as xyzw (Hamilton, scalar-last).
+        q = msg.pose.orientation
+        self._vehicle_quat_wxyz = np.array([q.w, q.x, q.y, q.z])
+
+        if self._control_trigger == 'imu':
+            self._run_control_loop_simtime(msg.header.stamp)
+
+    def _twist_callback(self, msg: TwistStamped):
+        # Body-frame angular velocity (FLU base_link per ros2_backend.py).
+        av = msg.twist.angular
+        self._body_angular_velocity_b = np.array([av.x, av.y, av.z])
 
     def _clock_callback(self, msg: Clock):
         if self._control_trigger == 'clock' and \

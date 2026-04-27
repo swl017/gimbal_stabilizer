@@ -29,6 +29,7 @@ setup(
             'los_rate_controller = gimbal_stabilizer.los_rate_controller:main',
             'gimbal_teleop_keyboard = gimbal_stabilizer.gimbal_teleop_keyboard:main',
             'joint_sign_test = gimbal_stabilizer.joint_sign_test:main',
+            'gimbal_step_response = gimbal_stabilizer.gimbal_step_response:main',
         ],
     },
 )
