@@ -58,6 +58,13 @@ from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Float32, Float64, Header
 
+from .dynamics import (
+    GimbalRateLoop,
+    GimbalRateLoopCfg,
+    ZoomDynamics,
+    ZoomDynamicsCfg,
+)
+
 # With identity camera orientation on pitch_link, yaw_joint=0 points camera
 # along body -Y (right side). This offset is added to yaw joint targets so
 # that controller yaw=0 maps to body +X (physics forward).
@@ -179,6 +186,26 @@ class LOSRateController(Node):
         #          as xyzw and body-frame angular velocity in twist.angular.
         self.declare_parameter('imu_source', 'mavros')
 
+        # -- SIYI gimbal rate-loop (mas/035, mas/036) parameters --
+        # Applies ONLY to the user-LOS-rate command path; body-motion
+        # compensation downstream bypasses this and stays instantaneous.
+        self.declare_parameter('rate_loop_enabled', True)
+        self.declare_parameter('rate_loop_tau_yaw_s', 0.0995)
+        self.declare_parameter('rate_loop_tau_pitch_s', 0.0954)
+        self.declare_parameter('rate_loop_max_rate_per_axis', 1.28)
+        self.declare_parameter('rate_loop_deadband_rad_s', 0.0)
+        self.declare_parameter('rate_loop_dead_time_s', 0.0)
+
+        # -- SIYI zoom dynamics (mas/037) parameters --
+        # zoom_model selects 'first_order' (legacy: integrator+lag) or
+        # 'siyi_a8' (slew-clip + dead-time + integrator + lag + quantize).
+        # Quantized output is published ONLY in siyi_a8 mode.
+        self.declare_parameter('zoom_model', 'siyi_a8')
+        self.declare_parameter('zoom_tau_s', 0.091)
+        self.declare_parameter('zoom_v_max_levels_per_s', 3.16)
+        self.declare_parameter('zoom_quantum_levels', 0.1)
+        self.declare_parameter('zoom_dead_time_s', 0.0)
+
         self._max_gimbal_rate = self.get_parameter('max_gimbal_rate').value
         self._pointing_gain = self.get_parameter('pointing_gain').value
         yaw_lim_deg = self.get_parameter('yaw_limits_deg').value
@@ -229,7 +256,6 @@ class LOSRateController(Node):
         self._target_el_world: float | None = None
 
         # -- Zoom state --
-        self._zoom_level: float = 1.0
         self._zoom_cmd_rate = 0.0
         self._zoom_min = float(self.get_parameter('zoom_min').value or 1.0)
         self._zoom_max = float(self.get_parameter('zoom_max').value or 30.0)
@@ -241,6 +267,30 @@ class LOSRateController(Node):
             raise ValueError(
                 f"Unknown imu_source '{self._imu_source}'. "
                 f"Supported: 'mavros', 'state'")
+
+        # -- Construct gimbal rate-loop and zoom dynamics --
+        self._rate_loop = GimbalRateLoop(GimbalRateLoopCfg(
+            enabled=bool(self.get_parameter('rate_loop_enabled').value),
+            tau_yaw_s=float(self.get_parameter('rate_loop_tau_yaw_s').value),
+            tau_pitch_s=float(self.get_parameter('rate_loop_tau_pitch_s').value),
+            max_rate_per_axis=float(
+                self.get_parameter('rate_loop_max_rate_per_axis').value),
+            deadband_rad_s=float(
+                self.get_parameter('rate_loop_deadband_rad_s').value),
+            dead_time_s=float(
+                self.get_parameter('rate_loop_dead_time_s').value),
+        ))
+        self._zoom_dyn = ZoomDynamics(ZoomDynamicsCfg(
+            model=str(self.get_parameter('zoom_model').value),
+            tau_zoom_s=float(self.get_parameter('zoom_tau_s').value),
+            zoom_min=self._zoom_min,
+            zoom_max=self._zoom_max,
+            v_max_levels_per_s=float(
+                self.get_parameter('zoom_v_max_levels_per_s').value),
+            quantum_levels=float(
+                self.get_parameter('zoom_quantum_levels').value),
+            dead_time_s=float(self.get_parameter('zoom_dead_time_s').value),
+        ))
 
         # -- QoS profiles --
         sensor_qos = QoSProfile(
@@ -312,7 +362,9 @@ class LOSRateController(Node):
             f'servo_rate_limit={math.degrees(self._servo_rate_limit):.1f} deg/s, '
             f'control_mode={self._control_mode}, '
             f'control_trigger={self._control_trigger}, '
-            f'gimbal_controller_mode={self._gimbal_controller_mode}')
+            f'gimbal_controller_mode={self._gimbal_controller_mode}, '
+            f'rate_loop_enabled={self._rate_loop.cfg.enabled}, '
+            f'zoom_model={self._zoom_dyn.cfg.model}')
 
     # ------------------------------------------------------------------
     # Subscriber callbacks
@@ -370,16 +422,19 @@ class LOSRateController(Node):
         self._zoom_cmd_rate = float(msg.data)
 
     def _zoom_level_set_callback(self, msg: Float64):
-        """Set zoom level directly (e.g., reset to 1.0 on IDLE)."""
-        level = float(msg.data)
-        level = max(self._zoom_min, min(self._zoom_max, level))
-        self._zoom_level = level
+        """Set zoom level directly (e.g., reset to 1.0 on IDLE).
+
+        Writes both the integrator target and the post-lag state so there
+        is no transient on initial-state randomization.
+        """
+        self._zoom_dyn.set_zoom(float(msg.data))
         self._zoom_cmd_rate = 0.0
-        # Publish immediately to sim camera
+        # Publish immediately to sim camera (quantized in siyi_a8 mode).
+        published = self._zoom_dyn.zoom_published
         cam_msg = Float64()
-        cam_msg.data = self._zoom_level
+        cam_msg.data = published
         self._camera_zoom_cmd_pub.publish(cam_msg)
-        self.get_logger().info(f'Zoom level set to {self._zoom_level:.1f}')
+        self.get_logger().info(f'Zoom level set to {published:.2f}')
 
     def _joint_state_callback(self, msg: JointState):
         """Parse and cache joint positions. Run control if trigger='joint_states'."""
@@ -466,9 +521,15 @@ class LOSRateController(Node):
                     actual_yaw, actual_pitch, self._vehicle_quat_wxyz)
                 self._az_world_initialized = True
 
-            # 1. Integrate LOS rate into candidate world-frame target
-            az_candidate = self._az_world + self._cmd_az_rate * dt
-            el_candidate = self._el_world + self._cmd_el_rate * dt
+            # 1. Pass user rate command through the SIYI rate loop, then
+            #    integrate the EFFECTIVE rate into the world-frame target.
+            #    The rate loop applies ONLY to this user-command path —
+            #    body-motion compensation in the J^{-1} stage below stays
+            #    instantaneous (mas/035 invariant).
+            az_rate_eff, el_rate_eff = self._rate_loop.step(
+                self._cmd_az_rate, self._cmd_el_rate, dt)
+            az_candidate = self._az_world + az_rate_eff * dt
+            el_candidate = self._el_world + el_rate_eff * dt
             az_candidate = math.atan2(math.sin(az_candidate), math.cos(az_candidate))
             el_candidate = float(np.clip(
                 el_candidate, self._pitch_limits[0], self._pitch_limits[1]))
@@ -807,16 +868,17 @@ class LOSRateController(Node):
         self._prev_actual_roll = actual_roll
         self._prev_actual_pitch = actual_pitch
 
-        # Zoom: integrate rate command (already in zoom-levels/s) and publish
-        if self._zoom_cmd_rate != 0.0:
-            self._zoom_level += self._zoom_cmd_rate * dt
-            self._zoom_level = max(self._zoom_min, min(self._zoom_max, self._zoom_level))
-            cam_zoom_cmd_msg = Float64()
-            cam_zoom_cmd_msg.data = self._zoom_level
-            self._camera_zoom_cmd_pub.publish(cam_zoom_cmd_msg)
+        # Zoom: advance the dynamics one step. Input is physical levels/s.
+        # Output is quantized to cfg.quantum_levels in siyi_a8 mode and
+        # continuous in first_order mode. Published every tick so consumers
+        # see the lag/quantization decay cleanly even after rate goes to 0.
+        zoom_pub = self._zoom_dyn.step(self._zoom_cmd_rate, dt)
+        cam_zoom_cmd_msg = Float64()
+        cam_zoom_cmd_msg.data = zoom_pub
+        self._camera_zoom_cmd_pub.publish(cam_zoom_cmd_msg)
 
         zoom_level_msg = Float64()
-        zoom_level_msg.data = self._zoom_level
+        zoom_level_msg.data = zoom_pub
         self._zoom_level_pub.publish(zoom_level_msg)
 
 

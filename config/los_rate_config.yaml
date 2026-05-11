@@ -1,7 +1,7 @@
 los_rate_controller:
-  max_gimbal_rate: 3.141593  # pi rad/s (180 deg/s) — matches iris_ma6 training env
-  yaw_limits_deg: [-180.0, 180.0]
-  pitch_limits_deg: [-45.0, 45.0]
+  max_gimbal_rate: 1.28  # pi rad/s (180 deg/s) — matches iris_ma6 training env
+  yaw_limits_deg: [-90.0, 90.0]
+  pitch_limits_deg: [-25.0, 45.0]
   roll_limits_deg: [-45.0, 45.0]
   feedback_blend: 0.05  # drift correction (0.0 for direct joint state writing)
   control_mode: "position_velocity"  # "position", "position_velocity", or "velocity"
@@ -10,3 +10,20 @@ los_rate_controller:
   control_trigger: "clock"  # "joint_states", "imu", or "clock"
   gimbal_controller_mode: "jacobian"
   imu_source: "state"  # "mavros" (PX4 EKF2, lagged) or "state" (Pegasus ground truth, sim-time)
+
+  # SIYI A8 gimbal rate-loop (mas/035 fit). Applies ONLY to the user-LOS-rate
+  # command path; body-motion compensation in J^{-1} stays instantaneous.
+  rate_loop_enabled: true
+  rate_loop_tau_yaw_s: 0.0995          # rate_model.json yaw τ
+  rate_loop_tau_pitch_s: 0.0954        # rate_model.json pitch τ
+  rate_loop_max_rate_per_axis: 1.28    # ≈73.3 deg/s, k at u=1 from rate_model.json
+  rate_loop_deadband_rad_s: 0.0
+  rate_loop_dead_time_s: 0.0           # deterministic dead time; 0 = disabled
+
+  # SIYI A8 zoom dynamics. zoom_model in {"first_order", "siyi_a8"}.
+  # Quantized output is published ONLY in siyi_a8 mode.
+  zoom_model: "siyi_a8"
+  zoom_tau_s: 0.091                    # mas/037 fit (legacy first_order default: 0.1)
+  zoom_v_max_levels_per_s: 3.16        # lens slew clip (siyi_a8 only)
+  zoom_quantum_levels: 0.1             # published-path quantum (siyi_a8 only)
+  zoom_dead_time_s: 0.0                # deterministic dead time; 0 = disabled
