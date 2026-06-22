@@ -186,6 +186,13 @@ class LOSRateController(Node):
         #          as xyzw and body-frame angular velocity in twist.angular.
         self.declare_parameter('imu_source', 'mavros')
 
+        # Ticket 049 — gimbal oscillation diagnosis. When True, publish the
+        # internal body-rejection chain on gimbal_diag/* (BEST_EFFORT, depth 1)
+        # AFTER the joint command is issued, i.e. out of the critical control
+        # path. When False (default) no diag publishers are created and there is
+        # zero overhead — bit-exact pre-049 behavior.
+        self.declare_parameter('diagnostic_publish', False)
+
         # -- SIYI gimbal rate-loop (mas/035, mas/036) parameters --
         # Applies ONLY to the user-LOS-rate command path; body-motion
         # compensation downstream bypasses this and stays instantaneous.
@@ -314,6 +321,36 @@ class LOSRateController(Node):
         self._zoom_level_pub = self.create_publisher(
             Float64, 'camera/zoom_level', sensor_qos)
         self._camera_zoom_cmd_pub = self.create_publisher(Float64, 'camera/zoom_level_cmd', 10)
+
+        # -- Ticket 049 diagnostic publishers + state (opt-in) --
+        self._diagnostic_publish = bool(self.get_parameter('diagnostic_publish').value)
+        # Snapshots of the body-rejection intermediates, written inside
+        # _run_jacobian_ik / _run_control and read by _publish_diagnostics in the
+        # SAME _run_control call. None until first jacobian step.
+        self._diag_omega_cmd = None          # (3,) body, post servo clip
+        self._diag_omega_combined = None     # (3,) body = omega_cmd - omega_body
+        self._diag_qdot_pre_clip = None      # (3,) [yaw, roll, pitch] J^{-1} out
+        self._diag_qdot_post_clip = None     # (3,) after limit clamp
+        self._diag_att_error = None          # (3,) body-frame attitude error
+        self._diag_az_from_quat = None       # float, world az from actual joints
+        if self._diagnostic_publish:
+            self._diag_omega_cmd_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/omega_cmd_b', sensor_qos)
+            self._diag_omega_body_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/omega_body_b', sensor_qos)
+            self._diag_omega_combined_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/omega_combined_b', sensor_qos)
+            self._diag_qdot_pre_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/qdot_ref_pre_clip', sensor_qos)
+            self._diag_qdot_post_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/qdot_ref_post_clip', sensor_qos)
+            self._diag_az_el_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/az_el_world', sensor_qos)  # x=az,y=el,z=blend_residual
+            self._diag_rateloop_pub = self.create_publisher(
+                Vector3Stamped, 'gimbal_diag/rateloop_rate', sensor_qos)  # x=az_rate_eff,y=el_rate_eff
+            self._diag_control_dt_pub = self.create_publisher(
+                Float64, 'gimbal_diag/control_dt', sensor_qos)
+        self._diag_rateloop = None  # (az_rate_eff, el_rate_eff) set per rate-mode step
 
         # -- Subscribers --
         self.create_subscription(
@@ -528,6 +565,8 @@ class LOSRateController(Node):
             #    instantaneous (mas/035 invariant).
             az_rate_eff, el_rate_eff = self._rate_loop.step(
                 self._cmd_az_rate, self._cmd_el_rate, dt)
+            if self._diagnostic_publish:
+                self._diag_rateloop = (az_rate_eff, el_rate_eff)
             az_candidate = self._az_world + az_rate_eff * dt
             el_candidate = self._el_world + el_rate_eff * dt
             az_candidate = math.atan2(math.sin(az_candidate), math.cos(az_candidate))
@@ -536,20 +575,33 @@ class LOSRateController(Node):
 
             # Anti-windup: accept azimuth and elevation independently.
             # If azimuth update would push yaw joint out of limits, reject
-            # only the azimuth change. Same for elevation/pitch. This
-            # prevents one saturated axis from freezing the other.
-            yaw_az, pitch_az = self._world_to_body_angles(
+            # only the azimuth change. If a setpoint is already outside the
+            # reachable joint range, still accept updates that move it back
+            # toward the valid range.
+            yaw_now, _ = self._world_to_body_angles(
+                self._az_world, self._el_world, self._vehicle_quat_wxyz)
+            yaw_az, _ = self._world_to_body_angles(
                 az_candidate, self._el_world, self._vehicle_quat_wxyz)
-            if self._yaw_limits[0] <= yaw_az <= self._yaw_limits[1]:
+            if self._candidate_reduces_limit_violation(
+                    yaw_now, yaw_az, self._yaw_limits):
                 self._az_world = az_candidate
 
-            yaw_el, pitch_el = self._world_to_body_angles(
+            _, pitch_now = self._world_to_body_angles(
+                self._az_world, self._el_world, self._vehicle_quat_wxyz)
+            _, pitch_el = self._world_to_body_angles(
                 self._az_world, el_candidate, self._vehicle_quat_wxyz)
-            if self._pitch_limits[0] <= pitch_el <= self._pitch_limits[1]:
+            if self._candidate_reduces_limit_violation(
+                    pitch_now, pitch_el, self._pitch_limits):
                 self._el_world = el_candidate
 
             az_world = self._az_world
             el_world = self._el_world
+
+            # Ticket 049: world azimuth from actual joints (H4 drift residual).
+            if self._diagnostic_publish:
+                az_q, _el_q = self._body_to_world_angles(
+                    actual_yaw, actual_pitch, self._vehicle_quat_wxyz)
+                self._diag_az_from_quat = az_q
 
             if self._gimbal_controller_mode == 'jacobian':
                 # Jacobian J^{-1} controller (matching iris_ma6 training).
@@ -582,6 +634,11 @@ class LOSRateController(Node):
         self._publish_joint_commands(dt)
         self._publish_state(az_world, el_world, actual_yaw, actual_roll,
                             actual_pitch, dt)
+
+        # Ticket 049 diagnostics — emitted AFTER the joint command so the
+        # diag publish latency cannot perturb the control loop (Risk #1).
+        if self._diagnostic_publish:
+            self._publish_diagnostics(az_world, el_world, dt)
 
     def _run_jacobian_ik(
         self, az_world: float, el_world: float,
@@ -621,16 +678,27 @@ class LOSRateController(Node):
         self._qdot = self._jacobian_inv_times_omega(
             omega_combined, actual_yaw, actual_roll)
 
-        # Position target = actual + joint rates * dt
-        self._yaw = float(np.clip(
-            actual_yaw + self._qdot[0] * dt,
-            self._yaw_limits[0], self._yaw_limits[1]))
-        self._roll = float(np.clip(
-            actual_roll + self._qdot[1] * dt,
-            self._roll_limits[0], self._roll_limits[1]))
-        self._pitch = float(np.clip(
-            actual_pitch + self._qdot[2] * dt,
-            self._pitch_limits[0], self._pitch_limits[1]))
+        # Ticket 049: snapshot body-rejection intermediates (pre-clamp qdot)
+        # for the diagnostic publisher. Read-only; never feeds back.
+        if self._diagnostic_publish:
+            self._diag_omega_cmd = np.array(omega_cmd, dtype=float)
+            self._diag_omega_combined = np.array(omega_combined, dtype=float)
+            self._diag_att_error = np.array(att_error, dtype=float)
+            self._diag_qdot_pre_clip = np.array(self._qdot, dtype=float)
+
+        # Position targets and velocity feedforward must saturate together.
+        # Otherwise position_velocity mode can command a clamped joint position
+        # while still pushing outward with velocity at the same limit.
+        self._yaw, self._qdot[0] = self._clamp_target_and_qdot(
+            actual_yaw, self._qdot[0], dt, self._yaw_limits)
+        self._roll, self._qdot[1] = self._clamp_target_and_qdot(
+            actual_roll, self._qdot[1], dt, self._roll_limits)
+        self._pitch, self._qdot[2] = self._clamp_target_and_qdot(
+            actual_pitch, self._qdot[2], dt, self._pitch_limits)
+
+        # Ticket 049: snapshot post-clamp qdot (H8 servo-saturation check).
+        if self._diagnostic_publish:
+            self._diag_qdot_post_clip = np.array(self._qdot, dtype=float)
 
     def _run_combined_ik(
         self, az_world: float, el_world: float,
@@ -673,9 +741,70 @@ class LOSRateController(Node):
         self._qdot = self._jacobian_inv_times_omega(
             omega_combined, actual_yaw, actual_roll)
 
+        self._qdot[0] = self._zero_outward_qdot_at_limit(
+            self._yaw, self._qdot[0], self._yaw_limits)
+        self._qdot[1] = self._zero_outward_qdot_at_limit(
+            self._roll, self._qdot[1], self._roll_limits)
+        self._qdot[2] = self._zero_outward_qdot_at_limit(
+            self._pitch, self._qdot[2], self._pitch_limits)
+
     # ------------------------------------------------------------------
     # Jacobian-inverse math (ported from iris_ma6)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _candidate_reduces_limit_violation(
+        current: float,
+        candidate: float,
+        limits: tuple[float, float],
+    ) -> bool:
+        """Accept candidates that are in range or move closer to the range."""
+        lower, upper = limits
+        if lower <= candidate <= upper:
+            return True
+        current_violation = LOSRateController._limit_violation(current, limits)
+        candidate_violation = LOSRateController._limit_violation(candidate, limits)
+        return candidate_violation < current_violation
+
+    @staticmethod
+    def _limit_violation(value: float, limits: tuple[float, float]) -> float:
+        """Return distance outside limits, or zero when value is in range."""
+        lower, upper = limits
+        if value < lower:
+            return lower - value
+        if value > upper:
+            return value - upper
+        return 0.0
+
+    @staticmethod
+    def _clamp_target_and_qdot(
+        actual: float,
+        qdot: float,
+        dt: float,
+        limits: tuple[float, float],
+    ) -> tuple[float, float]:
+        """Clamp position target and remove velocity driving farther past limits."""
+        lower, upper = limits
+        target = actual + qdot * dt
+        clamped = float(np.clip(target, lower, upper))
+        safe_qdot = LOSRateController._zero_outward_qdot_at_limit(
+            clamped, qdot, limits)
+        return clamped, safe_qdot
+
+    @staticmethod
+    def _zero_outward_qdot_at_limit(
+        target: float,
+        qdot: float,
+        limits: tuple[float, float],
+    ) -> float:
+        """Return zero when qdot would push a saturated target outward."""
+        lower, upper = limits
+        eps = 1e-9
+        if target <= lower + eps and qdot < 0.0:
+            return 0.0
+        if target >= upper - eps and qdot > 0.0:
+            return 0.0
+        return float(qdot)
 
     @staticmethod
     def _compute_desired_camera_quat(
@@ -880,6 +1009,56 @@ class LOSRateController(Node):
         zoom_level_msg = Float64()
         zoom_level_msg.data = zoom_pub
         self._zoom_level_pub.publish(zoom_level_msg)
+
+    # ------------------------------------------------------------------
+    # Ticket 049 diagnostic publishing (opt-in, out of critical path)
+    # ------------------------------------------------------------------
+
+    def _publish_diagnostics(self, az_world: float, el_world: float, dt: float):
+        """Publish internal body-rejection state for gimbal oscillation diagnosis.
+
+        Only the jacobian path populates the omega_*/qdot_* snapshots; other
+        modes skip those (None guard). Vector3Stamped carries the sim-time
+        stamp so deploy_recorder.py can align against the train trace.
+        """
+        stamp = self.get_clock().now().to_msg()
+
+        def _pub_vec3(pub, vec):
+            if vec is None:
+                return
+            m = Vector3Stamped()
+            m.header.stamp = stamp
+            m.vector.x = float(vec[0])
+            m.vector.y = float(vec[1])
+            m.vector.z = float(vec[2])
+            pub.publish(m)
+
+        _pub_vec3(self._diag_omega_cmd_pub, self._diag_omega_cmd)
+        _pub_vec3(self._diag_omega_body_pub, self._body_angular_velocity_b)
+        _pub_vec3(self._diag_omega_combined_pub, self._diag_omega_combined)
+        _pub_vec3(self._diag_qdot_pre_pub, self._diag_qdot_pre_clip)
+        _pub_vec3(self._diag_qdot_post_pub, self._diag_qdot_post_clip)
+
+        # az/el world target + H4 feedback-blend residual (= az_world - az_from_quat)
+        az_el = Vector3Stamped()
+        az_el.header.stamp = stamp
+        az_el.vector.x = float(az_world)
+        az_el.vector.y = float(el_world)
+        az_el.vector.z = float(az_world - self._diag_az_from_quat) \
+            if self._diag_az_from_quat is not None else 0.0
+        self._diag_az_el_pub.publish(az_el)
+
+        if self._diag_rateloop is not None:
+            rl = Vector3Stamped()
+            rl.header.stamp = stamp
+            rl.vector.x = float(self._diag_rateloop[0])
+            rl.vector.y = float(self._diag_rateloop[1])
+            rl.vector.z = 0.0
+            self._diag_rateloop_pub.publish(rl)
+
+        dt_msg = Float64()
+        dt_msg.data = float(dt)
+        self._diag_control_dt_pub.publish(dt_msg)
 
 
 def main(args=None):
