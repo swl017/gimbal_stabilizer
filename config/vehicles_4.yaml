@@ -1,0 +1,16 @@
+# RAL ticket 021 coop_2obs: 4-vehicle variant (px4_4 = second flown observer).
+# Used by isaac_sim_aggressive_4v.tmuxp.yaml via config_file:=config/vehicles_4.yaml;
+# the default vehicles.yaml (3 vehicles) keeps every existing session unchanged.
+vehicles:
+  - namespace: "px4_1"
+    update_rate: 100.0
+    model: "iris_gimbal3"
+  - namespace: "px4_2"
+    update_rate: 100.0
+    model: "iris_gimbal3"
+  - namespace: "px4_3"
+    update_rate: 100.0
+    model: "iris_gimbal3"
+  - namespace: "px4_4"
+    update_rate: 100.0
+    model: "iris_gimbal3"

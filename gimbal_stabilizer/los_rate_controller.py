@@ -540,14 +540,45 @@ class LOSRateController(Node):
             el_world = float(np.clip(
                 el_world, self._pitch_limits[0], self._pitch_limits[1]))
 
-            yaw_new, pitch_new = self._world_to_body_angles(
+            # RAL 043: roll-consistent joint extraction (was _world_to_body_angles +
+            # _compute_stabilizing_roll, which deflected the boresight when pitch != 0).
+            yaw_new, roll_new, pitch_new = self._world_to_body_joints(
                 az_world, el_world, self._vehicle_quat_wxyz)
-            roll_new = self._compute_stabilizing_roll(
-                yaw_new, self._vehicle_quat_wxyz)
 
             self._yaw = float(np.clip(yaw_new, self._yaw_limits[0], self._yaw_limits[1]))
             self._pitch = float(np.clip(pitch_new, self._pitch_limits[0], self._pitch_limits[1]))
             self._roll = float(np.clip(roll_new, self._roll_limits[0], self._roll_limits[1]))
+
+            # RAL 043: optional Jacobian body-rate velocity feedforward for the
+            # POSITION path (gimbal_controller_mode 'jacobian'/'combined'). The
+            # position target above stays the exact roll-consistent IK; only the
+            # velocity command changes. Default ('analytical') leaves _qdot None,
+            # so _publish_joint_commands emits the finite-difference velocity
+            # (target - prev_actual)/dt — which amplifies attitude noise by 1/dt
+            # and drives aggressive gimbal motion. The Jacobian FF instead is
+            # J^{-1}(-K*att_error - omega_body): it rejects body motion via the
+            # MEASURED body rate rather than by differencing the target, so it is
+            # smooth. Only takes effect when control_mode='position_velocity'.
+            if self._gimbal_controller_mode in ('jacobian', 'combined'):
+                q_desired = self._compute_desired_camera_quat(
+                    az_world, el_world, self._vehicle_quat_wxyz)
+                q_current = self._gimbal_joints_to_quat(
+                    actual_yaw, actual_roll, actual_pitch)
+                q_err = _quat_mul(q_current, _quat_inv(q_desired))
+                sign_w = 1.0 if q_err[0] >= 0 else -1.0
+                att_error = 2.0 * sign_w * q_err[1:4]
+                omega_cmd = -self._pointing_gain * att_error
+                omega_cmd = np.clip(
+                    omega_cmd, -self._servo_rate_limit, self._servo_rate_limit)
+                omega_combined = omega_cmd - self._body_angular_velocity_b
+                self._qdot = self._jacobian_inv_times_omega(
+                    omega_combined, actual_yaw, actual_roll)
+                self._qdot[0] = self._zero_outward_qdot_at_limit(
+                    self._yaw, self._qdot[0], self._yaw_limits)
+                self._qdot[1] = self._zero_outward_qdot_at_limit(
+                    self._roll, self._qdot[1], self._roll_limits)
+                self._qdot[2] = self._zero_outward_qdot_at_limit(
+                    self._pitch, self._qdot[2], self._pitch_limits)
 
         else:
             # ── Rate mode ────────────────────────────────────────────
@@ -893,10 +924,53 @@ class LOSRateController(Node):
         return yaw, pitch
 
     @staticmethod
+    def _world_to_body_joints(
+        azimuth: float, elevation: float, q_wxyz: np.ndarray,
+    ) -> tuple[float, float, float]:
+        """World az/el -> body gimbal joints (yaw, roll, pitch), roll-CONSISTENT.
+
+        RAL ticket 043 fix. The decoupled `_world_to_body_angles` + `_compute_stabilizing_roll`
+        solves yaw/pitch for the roll-FREE boresight `Rz(yaw)Ry(pitch)x̂` and then inserts a
+        horizon-leveling `Rx(roll)` BETWEEN yaw and pitch, which deflects the boresight off the
+        LOS whenever the joint pitch is non-zero (deflection grows with body tilt; RAL031 S9
+        measured ~11° of terminal peer pointing error arising entirely from this — the achieved
+        joints tracked the command, but the command itself missed).
+
+        Instead, extract the joints from the exact desired camera rotation
+        `R = [fwd_body | cam_right | cam_up]` (forward = LOS, up = world-up projected,
+        Gram-Schmidt — identical to `_compute_desired_camera_quat`). For the
+        Yaw(Z)->Roll(X)->Pitch(Y) chain, `R = Rz(yaw)Rx(roll)Ry(pitch)` gives
+            roll  = asin(R[2,1]);  pitch = atan2(-R[2,0], R[2,2]);  yaw = atan2(-R[0,1], R[1,1]).
+        This keeps the horizon level AND points the boresight at the LOS, consistently.
+        """
+        fwd_world = np.array([
+            math.cos(elevation) * math.cos(azimuth),
+            math.cos(elevation) * math.sin(azimuth),
+            math.sin(elevation)])
+        world_up = np.array([0.0, 0.0, 1.0])
+        fwd_body = _quat_rotate_inverse(q_wxyz, fwd_world)
+        up_body = _quat_rotate_inverse(q_wxyz, world_up)
+        cam_up = up_body - np.dot(up_body, fwd_body) * fwd_body
+        cam_up = cam_up / (np.linalg.norm(cam_up) + 1e-8)
+        cam_right = np.cross(cam_up, fwd_body)
+        R = np.column_stack([fwd_body, cam_right, cam_up])
+        roll = math.asin(float(np.clip(R[2, 1], -1.0, 1.0)))
+        pitch = math.atan2(-R[2, 0], R[2, 2])
+        yaw = math.atan2(-R[0, 1], R[1, 1])
+        return yaw, roll, pitch
+
+    @staticmethod
     def _compute_stabilizing_roll(
         gimbal_yaw: float, q_wxyz: np.ndarray,
     ) -> float:
-        """Compute roll to keep horizon level (for position mode)."""
+        """Compute roll to keep horizon level (for position mode).
+
+        NOTE (RAL 043): pairing this with `_world_to_body_angles` is roll-INCONSISTENT — the
+        inserted roll deflects the boresight when pitch != 0. Retained only for the rate-mode
+        `analytical` branch, which is not on the deployed (jacobian) path and was not validated
+        by RAL 043; the deployed POSITION branch now uses `_world_to_body_joints`. A future
+        pass should migrate the analytical branch too.
+        """
         world_up = np.array([0.0, 0.0, 1.0])
         up_in_body = _quat_rotate_inverse(q_wxyz, world_up)
         cos_yaw, sin_yaw = math.cos(gimbal_yaw), math.sin(gimbal_yaw)

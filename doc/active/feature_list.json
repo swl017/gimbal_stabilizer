@@ -27,6 +27,20 @@
       "status": "done",
       "notes": "Ports iris_ma6 analytical gimbal controller to ROS2. Accepts normalized az/el rate commands, integrates in world frame, computes body-frame joints via IK. Multi-agent launch via multi_agent_los_rate.launch.py",
       "last_updated": "2026-03-24"
+    },
+    {
+      "id": "fixed_mount_publisher",
+      "name": "Fixed (non-gimballed) camera mount",
+      "status": "in_progress",
+      "notes": "MAS ticket 055. Constant-pose stand-in for the real interceptor's rigidly bolted camera (forward, 30.8 deg UP, no zoom hardware): publishes the constant isaac_joint_commands plus the two constants the field stack shims onto the wire (gimbal_state_rpy_deg, camera/zoom_level), and deliberately NOT camera/zoom_level_cmd (it drives MonocularCamera.set_zoom, which rebuilds focal length as mean(fx,fy) and miscalibrates a non-square-pixel camera). Replaces los_rate_controller in the fixed-camera session; multi_agent_fixed_mount.launch.py, namespaces:= selects which vehicles. Wire contract verified on a live ROS graph. IN PROGRESS because AC3/AC4 (does the Isaac articulation actually hold the pose, and how much does the PD drive deflect in flight) need a running Isaac session \u2014 gimbal_mount_deflection_deg is the instrument for that. 2026-08-15 (cont.): added the ticket 055 D2 consistency guards \u2014 _check_boot_label (reads fixed_camera_vehicles out of /tmp/isaac_boot_label.json, requires /proc/<pid> alive so a stale label authorises nothing, RAISES if this vehicle is not listed) and _check_command_contention (ERRORs if a second publisher appears on isaac_joint_commands, i.e. a los_rate_controller overlapping the fixed set). Added config/vehicles_gimballed.yaml for the complement of a mixed session.",
+      "last_updated": "2026-08-15"
+    },
+    {
+      "id": "fixed_camera_session",
+      "name": "Fixed-camera SITL session (cross-package)",
+      "status": "in_progress",
+      "notes": "MAS ticket 055. This package supplies fixed_mount_publisher + multi_agent_fixed_mount.launch.py + config/vehicles_gimballed.yaml; the rest of the session lives outside it \u2014 PegasusSimulator/launch/px4_multi_world_iris_fixedcam.isaac.py (authors the fTheta fisheye, fail-closed readback), ros2_ws/src/sim_camera_relay (960->720 squeeze + rebuilt camera_info under the field's topic names), and IsaacPX4/tmux/isaac_sim_fixedcam.tmuxp.yaml. All code written and unit-verified offline; IN PROGRESS until the session is booted \u2014 ticket 055 AC1-AC6 all need a running Isaac.",
+      "last_updated": "2026-08-15"
     }
   ]
 }

@@ -142,3 +142,120 @@ None (standalone node).
 **Pattern**: Timer-only (no subscriptions)
 
 - `timer_callback()` (100 Hz): Publishes fixed joint positions. Stateless.
+
+---
+
+# FixedMountPublisher Node
+
+## Purpose
+Sim stand-in for the real interceptor's **rigidly bolted, non-gimballed** camera (MAS ticket
+055). The aircraft has no gimbal and no zoom hardware: the camera is bolted forward and pitched
+30.8° UP in body-FLU, and the field stack simply shims two constants onto the wire
+(`mas_fieldtest/src/tmux/intercept_mas.yaml:119-120`). This node is those two shims plus the
+constant `isaac_joint_commands` the sim additionally needs to hold Isaac's gimbal at the
+equivalent pose.
+
+It **replaces `los_rate_controller`** in the fixed-camera session. As with the other two
+controllers, only one may run per vehicle — they all publish `isaac_joint_commands`.
+
+Constants, not control, is the point: a rigid mount has no tracking dynamics, no rate loop and
+no body-motion rejection, so anything computed per tick would be a sim artifact with no
+counterpart in the aircraft.
+
+## Subscriptions
+- `isaac_joint_states` (`sensor_msgs/msg/JointState`) — feedback, used **only** by the
+  deflection monitor (`monitor_deflection: true`). Nothing on the output path reads it.
+
+## Publishers
+- `isaac_joint_commands` (`sensor_msgs/msg/JointState`) — constant joint positions (RELIABLE, depth 10)
+- `gimbal_state_rpy_deg` (`geometry_msgs/msg/Vector3`) — the constant mount pose in degrees
+- `camera/zoom_level` (`std_msgs/msg/Float64`) — constant, default 1.0 (suppressible)
+- `gimbal_mount_deflection_deg` (`geometry_msgs/msg/Vector3`) — peak-hold |achieved − commanded|
+  per joint, `(x=roll, y=pitch, z=yaw)`; ticket 055 AC4 instrumentation
+
+**Deliberately NOT published: `camera/zoom_level_cmd`.** Pegasus's `ROS2Backend` subscribes it
+and calls `MonocularCamera.set_zoom`, which rebuilds the camera's focal length as
+`mean(fx, fy)` — a no-op on a square-pixel camera, and a silent 444.76 → 388.87 px
+miscalibration on the interceptor's anisotropic one (ticket 055 F2). `los_rate_controller`
+publishes it every tick; this node must not.
+
+## Parameters
+- `mount_pitch_up_deg` (`float`, default: `30.8`) — mount pitch, **positive UP** (the field
+  convention), negated once internally
+- `mount_roll_deg` (`float`, default: `0.0`)
+- `mount_yaw_deg` (`float`, default: `0.0`) — +left about body +Z; 0 = forward
+- `model` (`string`, default: `iris_gimbal3`) — selects the joint-name mapping
+- `publish_rate_hz` (`float`, default: `50.0`)
+- `zoom_level` (`float`, default: `1.0`) / `publish_zoom_level` (`bool`, default: `true`)
+- `monitor_deflection` (`bool`, default: `true`) / `deflection_warn_deg` (`float`, default: `0.5`)
+- `check_boot_label` (`bool`, default: `true`) / `boot_label_path` (`string`, default:
+  `/tmp/isaac_boot_label.json`) — the Isaac/ROS consistency guard, below
+
+## Two consistency guards (ticket 055 D2)
+
+A mixed session picks the fixed-camera vehicles **twice**: on the Isaac side via
+`FIXED_CAMERA_VEHICLES`, on the ROS side via this node's launch `namespaces:=`. Two lists, two
+delivery mechanisms. A disagreement is silent and looks like a *tracking* bug rather than a
+*config* bug — fisheye intrinsics on a gimbal being swung by a LOS-rate controller, or a rigid
+mount still wearing the 1053 px pinhole. And it is likely: `VAR=... tmuxp load` is silently
+dropped whenever a tmux server exists, and an idle `keepalive` session keeps one alive on this
+box permanently.
+
+1. **Boot label** (`_check_boot_label`, at startup). `px4_multi_world_iris_fixedcam.isaac.py`
+   writes its selection into `/tmp/isaac_boot_label.json` as `fixed_camera_vehicles`; this node
+   reads it back and **raises** if its own vehicle id is absent. The label carries the writing
+   process's `pid`, and a label whose pid is not alive is treated as no label at all — a stale
+   file from a previous session must never authorise anything. Fail-closed on *disagreement*,
+   warn-only when the label is missing, stale, or predates ticket 055, so the node stays usable
+   against a hand-started sim. `check_boot_label:=false` skips it.
+2. **Command contention** (`_check_command_contention`, ~5 s after startup). Counts publishers
+   on `isaac_joint_commands`; more than one means a `los_rate_controller` is also driving this
+   vehicle. Both would publish and the articulation would follow whichever arrived last, so the
+   mount judders instead of holding. Logs an ERROR naming the topic and the likely cause.
+   Deferred rather than checked at startup because the two nodes usually start together.
+
+## Dependencies
+Imports `GIMBAL_MODELS` and `YAW_JOINT_OFFSET` from `los_rate_controller` rather than restating
+them — a duplicated convention constant is exactly the thing that drifts. Publishes
+`isaac_joint_commands` consumed by Isaac Sim; `gimbal_state_rpy_deg` and `camera/zoom_level`
+consumed by `mas_bearing_loc` (`raw_los_node`, `simple_ekf_node`, `dc_ekf_node`,
+`direct_projection_ekf_node`, `bearing_debug_viz`, `bearing_residual_monitor`).
+
+## Key Files
+- `gimbal_stabilizer/fixed_mount_publisher.py` — node implementation
+- `launch/multi_agent_fixed_mount.launch.py` — per-vehicle fan-out over `config/vehicles.yaml`;
+  `namespaces:=px4_1,px4_2` restricts which vehicles get a fixed mount, so a mixed
+  fixed/gimballed session can be assembled by launching this for one subset and
+  `multi_agent_los_rate*.launch.py` for the complement
+- `config/vehicles_gimballed.yaml` — the complement list for a mixed session, passed to
+  `multi_agent_los_rate_aggressive.launch.py config_file:=…`. Expressing the complement in a
+  new config file avoids editing that launch file, which every RAL cohort depends on. It must
+  not overlap `FIXED_CAMERA_VEHICLES`; guard 2 above catches it if it does
+- `../../tmux/isaac_sim_fixedcam.tmuxp.yaml` (in `IsaacPX4/tmux`) — the session that wires all
+  of this together
+
+## Calling Contract
+
+**Pattern**: Timer-only on the output path; the one subscription is instrumentation.
+
+- `_timer_callback()` (50 Hz): publishes all four topics. Sole periodic mutation point.
+- `_joint_state_callback()`: updates the peak-deflection hold and warns. Never publishes and
+  never feeds the command — `gimbal_state_rpy_deg` carries the CONSTANT, as the field does and
+  as a truly rigid mount would, so the PD drive's transient deflection cannot contaminate the
+  estimator input. It is reported out of band instead.
+
+## Sign Chain
+The USD joint signs are inverted with respect to the controller-internal convention, and the
+yaw joint carries a mesh offset. Verified across three files (ticket 055 `r_research.md` §5.1):
+
+| | internal | USD joint |
+|---|---|---|
+| yaw | 0 (forward) | `yaw_joint = +π/2` (`YAW_JOINT_OFFSET`) |
+| roll | `roll` | `roll_joint = −roll` |
+| pitch | `pitch` (**positive = DOWN**) | `pitch_joint = −pitch` |
+
+So a mount pitched **UP** by 30.8° is internal pitch −30.8° ⇒ `gimbal_state_rpy_deg.y = −30.8`
+(byte-identical to the field shim) and `pitch_joint = +30.8° = +0.5376 rad`.
+
+**The yaw offset is the easy mistake**: at `yaw_joint = 0` the camera looks along body −Y — out
+the right side — so commanding pitch alone points the camera at the vehicle's flank.

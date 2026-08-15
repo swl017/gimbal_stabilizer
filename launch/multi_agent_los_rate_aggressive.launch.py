@@ -83,7 +83,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'los_rate_config',
-            default_value='config/los_rate_config.yaml',
+            default_value='config/los_rate_config_aggressive.yaml',
             description='Path to the LOS rate controller configuration file'
         ),
         DeclareLaunchArgument(

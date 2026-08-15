@@ -15,3 +15,106 @@ Done:
 Next:
 - Fill in feature_list.json with current feature status
 - Add spec documents as needed for new features
+
+----------------------------------------
+2026-08-15 — fixed_mount_publisher: rigid (non-gimballed) camera mount
+----------------------------------------
+Done:
+- Added `fixed_mount_publisher` (+ `launch/multi_agent_fixed_mount.launch.py`, setup.py entry
+  point) for MAS ticket 055: the real interceptor has NO gimbal and NO zoom hardware — the
+  camera is bolted forward, pitched 30.8 deg UP in body-FLU — so the sim needs a node that
+  holds a constant pose rather than one that controls. It REPLACES `los_rate_controller` in
+  the fixed-camera Isaac session (a third mutually-exclusive `isaac_joint_commands` writer).
+- The node is exactly the two constants the field stack shims onto the wire
+  (`mas_fieldtest/src/tmux/intercept_mas.yaml:119-120`) plus the constant joint command:
+  `isaac_joint_commands` [yaw_joint, roll_joint, pitch_joint] = [+pi/2, 0, +0.5376] rad,
+  `gimbal_state_rpy_deg` (0.0, -30.8, 0.0), `camera/zoom_level` 1.0.
+- It deliberately does NOT publish `camera/zoom_level_cmd`. That topic drives
+  `MonocularCamera.set_zoom`, which rebuilds the camera focal length as MEAN(fx, fy) — a
+  no-op on a square-pixel camera and a silent 444.76 -> 388.87 px miscalibration on the
+  interceptor's anisotropic lens (fy/fx = 0.7487). `los_rate_controller` publishes it every
+  tick, which is why this is called out rather than just omitted.
+- `GIMBAL_MODELS` and `YAW_JOINT_OFFSET` are imported from `los_rate_controller`, not
+  restated, so the two nodes cannot drift on the airframe convention. QoS profiles copied
+  from it as well, so swapping the nodes does not change delivery semantics for any existing
+  subscriber.
+- Deflection monitor (`gimbal_mount_deflection_deg`, peak-hold + throttled warn above 0.5
+  deg): commanding a constant joint is NOT a rigid mount — the Isaac joint is a PD drive
+  (stiffness 1000, damping 50) and will deflect transiently. `gimbal_state_rpy_deg` still
+  carries the CONSTANT, as the field does and as a truly rigid mount would, so the deflection
+  is reported out of band where it can be measured without contaminating the estimator input.
+- Verified against a live ROS graph (not just imported): joint names/positions, the
+  rpy constant byte-identical to the field shim, zoom 1.0, `camera/zoom_level_cmd` confirmed
+  ABSENT, and the deflection monitor exercised with a synthetic 1.2 deg lag.
+- Updated CONTEXT.md (new node section incl. the full sign chain) and ARCHITECTURE.md
+  (third driver, node graph, directed dependencies).
+
+Next:
+- Unverified until an Isaac session runs: that the articulation actually HOLDS the commanded
+  pose, and the real drive deflection under aggressive flight (MAS ticket 055 AC3/AC4).
+- The other two 055 deliverables are not built yet: the fisheye launcher
+  (`px4_multi_world_iris_fixedcam.isaac.py`) and the tmuxp session
+  (`isaac_sim_fixedcam.tmuxp.yaml`), plus the 1280x960 -> 1280x720 resize stage that ticket
+  055 D1 introduced.
+
+----------------------------------------
+2026-08-15 (cont.) — fixed-camera session completed: guards, relay, launcher, tmuxp
+----------------------------------------
+Done:
+- Added TWO consistency guards to `fixed_mount_publisher` (MAS ticket 055 D2). A mixed session
+  picks the fixed-camera vehicles twice — Isaac's `FIXED_CAMERA_VEHICLES` and this node's
+  launch `namespaces:=` — and a disagreement is silent and reads as a tracking bug, not a
+  config bug:
+  * `_check_boot_label`: reads `/tmp/isaac_boot_label.json` (which the new Isaac launcher now
+    writes `fixed_camera_vehicles` into) and RAISES if this vehicle is not listed. Requires
+    /proc/<pid> alive, so a stale label from a previous session authorises nothing. Warns
+    rather than raises when the label is missing/stale/pre-055, so the node stays usable
+    against a hand-started sim.
+  * `_check_command_contention`: ~5 s after startup, counts publishers on
+    `isaac_joint_commands`. More than one means a los_rate_controller is also driving this
+    vehicle — both publish, the articulation follows whichever arrived last, and the mount
+    judders instead of holding. Logs an ERROR naming the topic.
+  Both verified: 5 boot-label cases (listed / not-listed / stale pid / no file / pre-055
+  label) behave as intended.
+- Added `config/vehicles_gimballed.yaml` — the complement list for a mixed session, passed to
+  `multi_agent_los_rate_aggressive.launch.py config_file:=`. Expressing the complement as a new
+  config file avoids editing that launch file, which every RAL cohort depends on.
+- Updated CONTEXT.md: the two guards, the new parameters, the new config file, and the pointer
+  to the tmuxp session.
+
+Elsewhere in this session (outside this package, MAS ticket 055):
+- NEW PACKAGE `sim_camera_relay` (ros2_ws/src) — squeezes the 1280x960 fisheye render to
+  1280x720 and republishes image + REBUILT camera_info under the field's topic names, so
+  neither the sim nor the deploy side needs changing. Verified end to end.
+- `PegasusSimulator/launch/px4_multi_world_iris_fixedcam.isaac.py` — authors the fTheta lens,
+  reads back everything it authors, refuses to boot on a mismatch.
+- `IsaacPX4/tmux/isaac_sim_fixedcam.tmuxp.yaml` — the session.
+
+Next:
+- Boot it. AC1-AC6 all need a running Isaac session; nothing further is codeable blind.
+
+----------------------------------------
+2026-08-15 (cont.) — bring-up: two fixed_mount_publisher defects found and fixed
+----------------------------------------
+Done:
+- THE BOOT-LABEL GUARD NEVER FIRED. It checked once at construction, but the ROS nodes start
+  ~5 s after `tmuxp load` while Isaac writes `/tmp/isaac_boot_label.json` at `world.reset()`
+  ~60 s in. It therefore always found no file and fell through to warn-and-proceed — the guard
+  never once did its job. Invisible in unit tests because every one of them wrote the label
+  first. Now polls every 2 s against `boot_label_wait_s` (default 180 s), logging the wait at
+  INFO throttled to 20 s. Verified live: "boot label OK: Isaac (pid 96333) lists vehicle 1 in
+  fixed_camera_vehicles=[1]".
+- THE AC4 PEAK-HOLD MEASURED THE STARTUP SLEW. Joints begin at zero while the mount pose is
+  yaw +90 / pitch +30.8, so the initial move registered as the peak: bring-up reported
+  "mount deflection 90.00 deg on yaw_joint", which is the commanded offset restated, not a
+  measurement — and it would have sat there all session masking the real number. The peak-hold
+  now ARMS on first convergence (all joints within tolerance simultaneously) and says so.
+  Real figure once holding: roll 0.0000 / pitch 0.0022 / yaw 0.0002 deg, against a 0.5 deg
+  budget — the commanded-joint mount is rigid enough, so the fixed-joint USD variant is not
+  needed.
+- Verified in the live mixed session: exactly 1 publisher on /px4_1/isaac_joint_commands with
+  los_rate_controller running on px4_2/px4_3 from vehicles_gimballed.yaml (no contention), and
+  /px4_1/camera/zoom_level_cmd does not exist at all.
+
+Next:
+- Nothing outstanding in this package. Ticket 055 AC1/AC5/AC6 need sim fixtures, not code here.

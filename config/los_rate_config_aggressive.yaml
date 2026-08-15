@@ -1,8 +1,8 @@
 los_rate_controller:
   max_gimbal_rate: 1.28  # pi rad/s (180 deg/s) — matches iris_ma6 training env
   yaw_limits_deg: [-360.0, 360.0]
-  pitch_limits_deg: [-25.0, 45.0]
-  roll_limits_deg: [-45.0, 45.0]
+  pitch_limits_deg: [-60.0, 60.0]
+  roll_limits_deg: [-60.0, 60.0]
   feedback_blend: 0.05  # drift correction (0.0 for direct joint state writing)
   control_mode: "position_velocity"  # "position", "position_velocity", or "velocity"
   pointing_gain: 32.5  # matches iris_ma6 training (K*dt=0.325 at 100Hz physics rate)
@@ -24,7 +24,7 @@ los_rate_controller:
   # Quantized output is published ONLY in siyi_a8 mode.
   zoom_model: "siyi_a8"
   zoom_min: 1.0                        # matches iris_ma6 training zoom_min
-  zoom_max: 6.0                        # matches iris_ma6 training zoom_max (mrcal trust region; mas/028)
+  zoom_max: 15.0                       
   zoom_tau_s: 0.091                    # mas/037 fit (legacy first_order default: 0.1)
   zoom_v_max_levels_per_s: 3.16        # lens slew clip (siyi_a8 only)
   zoom_quantum_levels: 0.1             # published-path quantum (siyi_a8 only)

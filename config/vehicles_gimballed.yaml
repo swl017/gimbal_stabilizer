@@ -1,0 +1,23 @@
+# The GIMBALLED complement for a mixed fixed-camera session (MAS ticket 055 D2).
+#
+# In isaac_sim_fixedcam.tmuxp.yaml the vehicles listed in FIXED_CAMERA_VEHICLES are driven by
+# fixed_mount_publisher; every OTHER vehicle keeps the LOS-rate controller. Since
+# multi_agent_los_rate_aggressive.launch.py fans out over whatever config file it is given,
+# the complement is expressed here rather than by editing that launch file (which every RAL
+# cohort depends on).
+#
+# THIS LIST AND `FIXED_CAMERA_VEHICLES` MUST NOT OVERLAP. If they do, two nodes publish
+# isaac_joint_commands for the same vehicle and the articulation follows whichever arrived
+# last — the mount judders instead of holding, which reads as a tracking fault rather than a
+# configuration one. fixed_mount_publisher checks for this ~5 s after startup and logs an
+# ERROR naming the topic, so the failure is loud; it is still cheaper to get the lists right.
+#
+# Default pairing (see the tmuxp file): FIXED_CAMERA_VEHICLES='1' -> px4_1 is the interceptor
+# with the real fisheye on a rigid mount; px4_2 and px4_3 keep today's gimbal.
+vehicles:
+  - namespace: "px4_2"
+    update_rate: 100.0
+    model: "iris_gimbal3"
+  - namespace: "px4_3"
+    update_rate: 100.0
+    model: "iris_gimbal3"

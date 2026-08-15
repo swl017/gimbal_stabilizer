@@ -27,6 +27,7 @@ setup(
             'joint_state_publisher = gimbal_stabilizer.joint_state_publisher:main',
             'gimbal_stabilizer = gimbal_stabilizer.gimbal_stabilizer:main',
             'los_rate_controller = gimbal_stabilizer.los_rate_controller:main',
+            'fixed_mount_publisher = gimbal_stabilizer.fixed_mount_publisher:main',
             'gimbal_teleop_keyboard = gimbal_stabilizer.gimbal_teleop_keyboard:main',
             'joint_sign_test = gimbal_stabilizer.joint_sign_test:main',
             'gimbal_step_response = gimbal_stabilizer.gimbal_step_response:main',

@@ -1,10 +1,12 @@
 # gimbal_stabilizer Architecture
 
-Gimbal camera stabilization control. Two mutually exclusive controllers:
+Gimbal camera stabilization control. Three mutually exclusive gimbal drivers:
 1. **gimbal_stabilizer**: Body-frame RPY position-based stabilization (counteracts vehicle rotation)
 2. **los_rate_controller**: World-frame LOS rate control for RL policy deployment (iris_ma6 port)
+3. **fixed_mount_publisher**: No control at all — a constant pose standing in for the real
+   interceptor's rigidly bolted, non-gimballed camera (MAS ticket 055)
 
-Only one controller should run per vehicle — they both publish to `isaac_joint_commands`.
+Only one should run per vehicle — they all publish to `isaac_joint_commands`.
 
 ## Node Graph
 
@@ -17,12 +19,16 @@ Only one controller should run per vehicle — they both publish to `isaac_joint
     ┌──────────────┼──────────────────────────────────┐
     │              │                                    │
     ▼              ▼                                    ▼
- gimbal_stabilizer  los_rate_controller     joint_state_publisher
- (body-frame RPY)   (world-frame LOS rate)  (test/example)
+ gimbal_stabilizer  los_rate_controller  fixed_mount_publisher  joint_state_publisher
+ (body-frame RPY)   (world-frame LOS)    (constant, no gimbal)  (test/example)
      [mutually exclusive — pick one]
 ```
 
 **LOS rate controller** has its own launch file: `multi_agent_los_rate.launch.py`
+(and `multi_agent_los_rate_aggressive.launch.py`).
+**Fixed mount** has `multi_agent_fixed_mount.launch.py`, whose `namespaces:=` argument
+restricts which vehicles get it — so a MIXED session (fixed-camera interceptor + gimballed
+observers) is assembled by launching it for one subset and a LOS-rate launch for the complement.
 
 ## Directed Dependencies
 
@@ -43,6 +49,16 @@ RL policy ──[gimbal_cmd_los_rate]──→ los_rate_controller    (Vector3: 
 los_rate_controller ──[isaac_joint_commands]──→ Isaac Sim   (JointState: joint position commands)
 los_rate_controller ──[gimbal_state_rpy_rad]──→ downstream  (Vector3: body-frame RPY)
 los_rate_controller ──[gimbal_state_rpy_deg]──→ downstream  (Vector3: body-frame RPY degrees)
+
+# fixed_mount_publisher (rigid mount, no gimbal — MAS ticket 055)
+fixed_mount_publisher ──[isaac_joint_commands]──→ Isaac Sim  (JointState: CONSTANT joint positions)
+fixed_mount_publisher ──[gimbal_state_rpy_deg]──→ downstream (Vector3: the constant mount pose)
+fixed_mount_publisher ──[camera/zoom_level]──→ downstream    (Float64: constant 1.0)
+fixed_mount_publisher ──[gimbal_mount_deflection_deg]──→ diagnostics (Vector3: peak |achieved-commanded|)
+Isaac Sim ──[isaac_joint_states]──→ fixed_mount_publisher    (JointState: deflection monitor ONLY)
+# NOTE: does NOT publish camera/zoom_level_cmd — that drives MonocularCamera.set_zoom, which
+# rebuilds the focal length as mean(fx, fy) and silently miscalibrates a non-square-pixel
+# camera (ticket 055 F2). los_rate_controller publishes it every tick; this node must not.
 los_rate_controller ──[gimbal_los_state_deg]──→ downstream      (Vector3: world-frame az/el)
 ```
 
